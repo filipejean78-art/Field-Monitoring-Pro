@@ -6,6 +6,7 @@
 <meta name="system" content="Field Monitoring Pro">
 <title>Field Monitoring Pro - Produção</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <style></style>
 <script id="csvData" type="text/plain" >
 tipo,label,valor,unidade,cor,chart,categoria,serie,secao
@@ -567,45 +568,97 @@ body.dark .fleet-hint code{background:rgba(148,163,184,0.12);border-color:rgba(1
 <!-- ===== SCRIPT DE AUTENTICAÇÃO ===== -->
 <script>
 // ========================================
-// ⚙️ CONFIGURAÇÃO DE USUÁRIOS
 // ========================================
+// ⚙️ SUPABASE — configuração central
+// ========================================
+const SUPABASE_URL  = 'https://cxzsmetztomvilzipurj.supabase.co';
+const SUPABASE_ANON = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImN4enNtZXR6dG9tdmlsemlwdXJqIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI5MTg3MjksImV4cCI6MjA4ODQ5NDcyOX0.AtspbUEoaTxt14vnHVcj8vzJxr5OXR63vmMeN2-utc8';
+const _sb = supabase.createClient(SUPABASE_URL, SUPABASE_ANON);
 
-const USUARIOS = {
-  'operador@empresa.com': {
-    senha: '123456',
-    nome: 'Operador',
-    funcao: 'operador',
-    frentes: ['F34', 'F36'],
-    permissoes: { verDashboard: true, verConfigs: false, verRealizados: false, editarDados: false, gerenciarUsuarios: false },
-    // 🗂️ Abas visíveis: 'plantio' | 'preparo' | 'composto' | 'realizados' | 'dimensionamento' | 'configuracoes'
-    abas: ['plantio', 'preparo', 'composto']
-  },
+// ========================================
+// 🗄️ KV STORE — substitui localStorage
+// Persiste no Supabase (tabela kv_store).
+// Mantém fallback em localStorage para
+// operação offline e chaves de UI efémeras.
+// ========================================
+const KV_OFFLINE_KEYS = new Set([
+  'configTab','theme','modo_gestor'   // preferências de UI — apenas local
+]);
 
-    'fjferreira@adecoagro.com': {
-        senha: 'Adeco',
-        nome: 'Filipe',
-        funcao: 'admin',
-        frentes: ['F34', 'F36', 'F38'],
-        permissoes: {
-            verDashboard: true,
-            verConfigs: true,
-            verRealizados: true,
-            editarDados: true,
-            gerenciarUsuarios: true
-        },
-        // Admin vê tudo
-        abas: ['plantio', 'preparo', 'composto', 'realizados', 'dimensionamento', 'configuracoes']
-    },
-    'coabr@adecoagro.com': {
-    senha: '123456',
-    nome: 'Operador',
-    funcao: 'operador',
-    frentes: ['F34', 'F36'],
-    permissoes: { verDashboard: true, verConfigs: false, verRealizados: false, editarDados: false, gerenciarUsuarios: false },
-    abas: ['plantio', 'preparo', 'composto']
-  },
+const _kvCache = {};   // cache em memória para leituras síncronas
 
-};
+async function kvGet(key) {
+  if (KV_OFFLINE_KEYS.has(key)) {
+    return localStorage.getItem(key);
+  }
+  try {
+    const uid = _sb.auth.getUser ? (await _sb.auth.getUser()).data?.user?.id : null;
+    if (!uid) return localStorage.getItem(key);
+    const { data, error } = await _sb
+      .from('kv_store')
+      .select('value')
+      .eq('user_id', uid)
+      .eq('key', key)
+      .maybeSingle();
+    if (error) throw error;
+    const val = data ? data.value : null;
+    if (val !== null) _kvCache[key] = val;
+    return val ?? localStorage.getItem(key);   // fallback offline
+  } catch(e) {
+    console.warn('[kvGet] fallback local para', key, e);
+    return localStorage.getItem(key);
+  }
+}
+
+async function kvSet(key, value) {
+  _kvCache[key] = value;
+  localStorage.setItem(key, value);            // write-through local (offline)
+  if (KV_OFFLINE_KEYS.has(key)) return;
+  try {
+    const uid = _sb.auth.getUser ? (await _sb.auth.getUser()).data?.user?.id : null;
+    if (!uid) return;
+    await _sb.from('kv_store').upsert(
+      { user_id: uid, key, value, updated_at: new Date().toISOString() },
+      { onConflict: 'user_id,key' }
+    );
+  } catch(e) {
+    console.warn('[kvSet] gravação remota falhou para', key, e);
+  }
+}
+
+async function kvRemove(key) {
+  delete _kvCache[key];
+  localStorage.removeItem(key);
+  if (KV_OFFLINE_KEYS.has(key)) return;
+  try {
+    const uid = _sb.auth.getUser ? (await _sb.auth.getUser()).data?.user?.id : null;
+    if (!uid) return;
+    await _sb.from('kv_store').delete()
+      .eq('user_id', uid).eq('key', key);
+  } catch(e) {
+    console.warn('[kvRemove] remoção remota falhou para', key, e);
+  }
+}
+
+// Pré-carrega todas as chaves do usuário em _kvCache (chamado após login)
+async function kvPreload() {
+  try {
+    const uid = _sb.auth.getUser ? (await _sb.auth.getUser()).data?.user?.id : null;
+    if (!uid) return;
+    const { data, error } = await _sb
+      .from('kv_store')
+      .select('key,value')
+      .eq('user_id', uid);
+    if (error) throw error;
+    (data || []).forEach(row => {
+      _kvCache[row.key] = row.value;
+      localStorage.setItem(row.key, row.value);  // sync local
+    });
+    console.log('[kvPreload] carregadas', (data||[]).length, 'chaves do Supabase');
+  } catch(e) {
+    console.warn('[kvPreload] usando apenas localStorage', e);
+  }
+}
 
 // ========================================
 // 🗂️ MAPA: id do botão → chave da aba
@@ -624,54 +677,72 @@ const ABA_BTN_MAP = {
 
 let usuarioAtual = null;
 
-function handleLogin(event) {
+// ========================================
+// 🔐 AUTENTICAÇÃO — Supabase Auth
+// ========================================
+
+async function handleLogin(event) {
     event.preventDefault();
 
-    const email = document.getElementById('loginEmail').value.trim();
-    const senha = document.getElementById('loginPassword').value;
-    const errorEl = document.getElementById('authError');
+    const email  = document.getElementById('loginEmail').value.trim();
+    const senha  = document.getElementById('loginPassword').value;
 
-    // Validar
-    if (!email || !senha) {
-        showError('Preencha email e senha');
-        return;
+    if (!email || !senha) { showError('Preencha email e senha'); return; }
+
+    const btnLogin = event.target.querySelector('button[type="submit"]');
+    if (btnLogin) { btnLogin.disabled = true; btnLogin.textContent = '⏳ Entrando...'; }
+
+    try {
+        const { data, error } = await _sb.auth.signInWithPassword({ email, password: senha });
+        if (error) throw error;
+
+        // Busca perfil na tabela profiles
+        const { data: profile } = await _sb
+            .from('profiles')
+            .select('*')
+            .eq('id', data.user.id)
+            .maybeSingle();
+
+        usuarioAtual = {
+            email: data.user.email,
+            nome: profile?.nome || data.user.email.split('@')[0],
+            funcao: profile?.funcao || 'operador',
+            frentes: profile?.frentes || ['F34','F36'],
+            permissoes: profile?.permissoes || {
+                verDashboard: true, verConfigs: false,
+                verRealizados: false, editarDados: false, gerenciarUsuarios: false
+            },
+            abas: profile?.abas || ['plantio','preparo','composto'],
+            loginTime: new Date().toISOString()
+        };
+
+        sessionStorage.setItem('usuario_logado', JSON.stringify(usuarioAtual));
+
+        // Pré-carrega dados do Supabase em background
+        kvPreload().then(() => {
+            try { if (typeof renderDashboardSimples === 'function') renderDashboardSimples();
+                  else if (typeof renderDashboard === 'function') renderDashboard(); } catch(e) {}
+        });
+
+        showMainContent();
+
+    } catch(err) {
+        console.error('[login]', err);
+        const msg = err.message?.includes('Invalid login') ? '❌ Email ou senha incorretos'
+                  : err.message?.includes('Email not confirmed') ? '⚠️ Confirme seu email antes de entrar'
+                  : '❌ Erro ao entrar: ' + (err.message || 'tente novamente');
+        showError(msg);
+    } finally {
+        if (btnLogin) { btnLogin.disabled = false; btnLogin.textContent = '🔓 Entrar'; }
     }
-
-    // Buscar usuário
-    const usuario = USUARIOS[email];
-
-    if (!usuario) {
-        showError('❌ Email não encontrado');
-        return;
-    }
-
-    if (usuario.senha !== senha) {
-        showError('❌ Senha incorreta');
-        return;
-    }
-
-    // Login bem-sucedido
-    usuarioAtual = {
-        email,
-        ...usuario,
-        loginTime: new Date().toISOString()
-    };
-
-    // Salvar sessão
-    sessionStorage.setItem('usuario_logado', JSON.stringify(usuarioAtual));
-
-    // Mostrar conteúdo
-    showMainContent();
 }
 
 function showError(msg) {
     const errorEl = document.getElementById('authError');
+    if (!errorEl) return;
     errorEl.textContent = msg;
     errorEl.classList.add('show');
-
-    setTimeout(() => {
-        errorEl.classList.remove('show');
-    }, 4000);
+    setTimeout(() => errorEl.classList.remove('show'), 4000);
 }
 
 function showMainContent() {
@@ -686,75 +757,95 @@ function showMainContent() {
     if (el) el.style.display = "none";
   });
   var emailEl = document.getElementById('userEmail');
-  if (emailEl && typeof usuarioAtual === 'object' && usuarioAtual && usuarioAtual.email) {
-    emailEl.textContent = usuarioAtual.email;
-  }
+  if (emailEl && usuarioAtual?.email) emailEl.textContent = usuarioAtual.email;
   var roleBadge = document.getElementById('userRole');
-  if (roleBadge && typeof usuarioAtual === 'object' && usuarioAtual && usuarioAtual.funcao) {
+  if (roleBadge && usuarioAtual?.funcao) {
     roleBadge.textContent = String(usuarioAtual.funcao).toUpperCase();
     roleBadge.className = (roleBadge.className ? roleBadge.className + ' ' : '') + 'user-badge ' + usuarioAtual.funcao;
   }
   try { if (typeof aplicarPermissoes === 'function') aplicarPermissoes(); } catch(e) { console.warn('aplicarPermissoes falhou:', e); }
   try {
-    if (typeof renderDashboardSimples === 'function') { renderDashboardSimples(); }
-    else if (typeof renderDashboard === 'function') { renderDashboard(); }
+    if (typeof renderDashboardSimples === 'function') renderDashboardSimples();
+    else if (typeof renderDashboard === 'function') renderDashboard();
   } catch(e) { console.warn('render do dashboard falhou:', e); }
-
-
-    
 }
 
 function aplicarPermissoes() {
+    if (!usuarioAtual) return;
     const perm = usuarioAtual.permissoes;
-    // Abas permitidas (default: tudo se não definido)
     const abasPermitidas = new Set(usuarioAtual.abas || Object.keys(ABA_BTN_MAP).map(k => ABA_BTN_MAP[k]));
 
-    // ── Controle de abas ──
-    // Esconde todos os botões de aba e exibe somente os permitidos
     Object.entries(ABA_BTN_MAP).forEach(([btnId, chaveAba]) => {
         const btn = document.getElementById(btnId);
         if (!btn) return;
         btn.style.display = abasPermitidas.has(chaveAba) ? '' : 'none';
     });
 
-    // Garante que a primeira aba permitida seja exibida ao carregar
     const primeiraAba = Object.keys(ABA_BTN_MAP).find(k => abasPermitidas.has(ABA_BTN_MAP[k]));
     if (primeiraAba) {
         const btn = document.getElementById(primeiraAba);
         if (btn) setTimeout(() => btn.click(), 0);
     }
 
-    if (!perm.editarDados) {
-        document.body.classList.add('modo-visualizacao');
-    }
-
-    // Indicador visual restrito
+    if (!perm.editarDados) document.body.classList.add('modo-visualizacao');
     if (!perm.verConfigs) {
         document.querySelectorAll('[data-restricted="config"]').forEach(el => el.classList.add('restricted'));
     }
 }
 
 // ========================================
-// 🚪 LOGOUT
+// 🚪 LOGOUT + sessão inicial
 // ========================================
 
-document.addEventListener('DOMContentLoaded', function() {
-    // Verificar se já está logado
-    const sessao = sessionStorage.getItem('usuario_logado');
-    if (sessao) {
-        try {
-            usuarioAtual = JSON.parse(sessao);
-            showMainContent();
-        } catch (e) {
-            sessionStorage.removeItem('usuario_logado');
+document.addEventListener('DOMContentLoaded', async function() {
+
+    // 1. Tenta retomar sessão Supabase ativa
+    const { data: { session } } = await _sb.auth.getSession();
+
+    if (session) {
+        // Sessão JWT válida
+        const { data: profile } = await _sb
+            .from('profiles')
+            .select('*')
+            .eq('id', session.user.id)
+            .maybeSingle();
+
+        usuarioAtual = {
+            email: session.user.email,
+            nome: profile?.nome || session.user.email.split('@')[0],
+            funcao: profile?.funcao || 'operador',
+            frentes: profile?.frentes || ['F34','F36'],
+            permissoes: profile?.permissoes || {
+                verDashboard: true, verConfigs: false,
+                verRealizados: false, editarDados: false, gerenciarUsuarios: false
+            },
+            abas: profile?.abas || ['plantio','preparo','composto'],
+            loginTime: new Date().toISOString()
+        };
+
+        sessionStorage.setItem('usuario_logado', JSON.stringify(usuarioAtual));
+        kvPreload();       // carrega dados em background
+        showMainContent();
+
+    } else {
+        // Sem sessão Supabase — verifica sessionStorage (recarga de página)
+        const sessao = sessionStorage.getItem('usuario_logado');
+        if (sessao) {
+            try {
+                usuarioAtual = JSON.parse(sessao);
+                showMainContent();
+            } catch(e) {
+                sessionStorage.removeItem('usuario_logado');
+            }
         }
     }
 
     // Logout
     const btnLogout = document.getElementById('btnLogout');
     if (btnLogout) {
-        btnLogout.onclick = function() {
+        btnLogout.onclick = async function() {
             if (confirm('Desconectar?')) {
+                await _sb.auth.signOut();
                 sessionStorage.removeItem('usuario_logado');
                 usuarioAtual = null;
                 location.reload();
@@ -765,7 +856,10 @@ document.addEventListener('DOMContentLoaded', function() {
     // Sincronizar
     const btnSync = document.getElementById('btnSync');
     if (btnSync) {
-        btnSync.onclick = function() {
+        btnSync.onclick = async function() {
+            await kvPreload();
+            try { if (typeof renderDashboardSimples === 'function') renderDashboardSimples();
+                  else if (typeof renderDashboard === 'function') renderDashboard(); } catch(e) {}
             alert('✅ Dados sincronizados\n\nÚltima atualização: ' + new Date().toLocaleTimeString('pt-BR'));
         };
     }
@@ -3040,7 +3134,7 @@ body{
       style="padding:8px 18px;background:#0369a1;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:700;cursor:pointer;">
       📥 Exportar Log (.xlsx)
     </button>
-    <button onclick="if(confirm('Apagar todo o log?')){localStorage.removeItem('dashboard_status_log_v1');alert('Log apagado.')}"
+    <button onclick="if(confirm('Apagar todo o log?')){kvRemove('dashboard_status_log_v1');delete _kvCache['dashboard_status_log_v1'];alert('Log apagado.')}"
       style="padding:8px 14px;background:#fee2e2;color:#b91c1c;border:1px solid #fca5a5;border-radius:8px;font-size:12px;cursor:pointer;">
       🗑 Limpar Log
     </button>
@@ -4229,7 +4323,7 @@ function renderInformativo() {
     return null;
   }
   function loadFrontMap(){ try{ return JSON.parse(localStorage.getItem(SITE_FRONT_KEY)||'{}')||{}; }catch(e){ return {}; } }
-  function saveFrontMap(m){ localStorage.setItem(SITE_FRONT_KEY, JSON.stringify(m||{})); }
+  function saveFrontMap(m){ const v=JSON.stringify(m||{}); _kvCache[SITE_FRONT_KEY]=v; localStorage.setItem(SITE_FRONT_KEY, v); kvSet(SITE_FRONT_KEY,v); }
   function getFrentesSite(site){
     let equip={};
     try{ equip=JSON.parse(localStorage.getItem(LS_EQUIP)||'{}')||{}; }catch(e){}
@@ -4267,7 +4361,7 @@ function renderInformativo() {
     else if(frs.length) sel.value=frs[0];
   }
   function setSite(s){
-    localStorage.setItem(SITE_KEY,s);
+    localStorage.setItem(SITE_KEY,s); kvSet(SITE_KEY,s);
     updateTabs();
     updateFrontSelect();
     loadFrotasFromEquip();
@@ -4312,8 +4406,8 @@ function renderInformativo() {
   });
   setInterval(loadFrotasFromEquip, 15000);
   const HIST = ()=> 'dim_hist_'+getSite();
-  function salvar(obj){ const k=HIST(); const arr=JSON.parse(localStorage.getItem(k)||'[]'); arr.push(obj); localStorage.setItem(k, JSON.stringify(arr)); renderAll(); }
-  function atualizar(arr){ localStorage.setItem(HIST(), JSON.stringify(arr||[])); renderAll(); }
+  function salvar(obj){ const k=HIST(); const arr=JSON.parse(_kvCache[k]||localStorage.getItem(k)||'[]'); arr.push(obj); const v=JSON.stringify(arr); _kvCache[k]=v; localStorage.setItem(k, v); kvSet(k,v); renderAll(); }
+  function atualizar(arr){ const k=HIST(); const v=JSON.stringify(arr||[]); _kvCache[k]=v; localStorage.setItem(k, v); kvSet(k,v); renderAll(); }
   function filtraFrente(arr){ const fr=frenteAtual(); return (arr||[]).filter(x=>!x.frente || x.frente===fr); }
   window.Dim_alocar = function(){ const dist=parseFloat(document.getElementById('dim_distancia').value)||0; const v1=parseFloat(document.getElementById('dim_velIda').value)||1; const v2=parseFloat(document.getElementById('dim_velVolta').value)||1; const tp=parseFloat(document.getElementById('dim_tempoParado').value)||0; const frota=(document.getElementById('dim_frota').value||'').trim(); const destino=document.getElementById('dim_destino').value; const frente=frenteAtual(); if(!frota){ alert('Informe a frota'); return; } const now=new Date(); const chegada=new Date(now.getTime()+(dist/v1)*3600000); salvar({ frota, frente, destino, saidaISO: now.toISOString(), chegadaPrevISO: chegada.toISOString(), chegadaMudaISO: null, saidaPrevISO:null, retornoPrevISO:null, retornoRealISO:null, tempoTeoricoMin: (dist/v1)*60 + tp + (dist/v2)*60, status: 'transito' }); }
   function render(){ const h = filtraFrente(JSON.parse(localStorage.getItem(HIST())||'[]')); const painel = document.getElementById('dim_painel'); if(!painel) return; painel.innerHTML=''; let fin=0, dentro=0, somaR=0, somaT=0; const now=new Date(); h.forEach((it,i)=>{ const frenteTxt = it.frente ? ' • '+it.frente : ''; if(it.status==='transito'){ const eta=new Date(it.chegadaPrevISO); const atraso = now>eta ? '<span class="badge atraso">ATRASO</span>' : '';
@@ -4461,7 +4555,7 @@ function getParesTempo(){
   }}catch(e){}
   return pares;
 }
-function saveParesTempo(arr){ if(!Array.isArray(arr)) return; localStorage.setItem(LS_PARES_TEMPO_KEY, JSON.stringify(arr)); }
+function saveParesTempo(arr){ if(!Array.isArray(arr)) return; const v=JSON.stringify(arr); _kvCache[LS_PARES_TEMPO_KEY]=v; localStorage.setItem(LS_PARES_TEMPO_KEY, v); kvSet(LS_PARES_TEMPO_KEY,v); }
 if (typeof window!== 'undefined' && typeof window.FRENTES === 'undefined'){ Object.defineProperty(window,'FRENTES',{ get: ()=> getFrentesPlantio(), configurable:true }); }
 const svgNS="http://www.w3.org/2000/svg";
 const uniq=a=>[...new Set(a)];
@@ -4491,7 +4585,7 @@ const pretty={
 const FRENTES_DEFAULT=['F34','F36','F38'];
 function getFrentesByLS(lsKey, def){ try{ const arr=JSON.parse(localStorage.getItem(lsKey)||'[]'); if(Array.isArray(arr)&&arr.length>0) return arr; }catch(e){} return (def||[]).slice(); }
 function getFrentesPlantio(){ return getFrentesByLS(LS_FRENTES_KEY, FRENTES_DEFAULT); }
-function saveFrentesPlantio(arr){ if(!Array.isArray(arr)) return; localStorage.setItem(LS_FRENTES_KEY, JSON.stringify(arr)); }
+function saveFrentesPlantio(arr){ if(!Array.isArray(arr)) return; const v=JSON.stringify(arr); _kvCache[LS_FRENTES_KEY]=v; localStorage.setItem(LS_FRENTES_KEY, v); kvSet(LS_FRENTES_KEY,v); }
 function getFrentesColheita(){ return getFrentesByLS('dashboard_frentes_colhedora_v1',['F39','F41']); }
 function getFrentesGrunner(){ return getFrentesByLS('dashboard_frentes_grunner_v1',['F39','F41']); }
 function getFrentesPreparo(){ return getFrentesByLS('dashboard_preparo_frentes_v1',['F18','F28']); }
@@ -4547,7 +4641,7 @@ function getParesDinamicos(){
   }catch(e){}
   return [];
 }
-function saveParesDinamicos(arr){ localStorage.setItem(LS_PARES_PLANT_KEY, JSON.stringify((arr||[]).map(function(p){ return Object.assign({}, p, { site: inferSiteParDinamico(p) }); }))); }
+function saveParesDinamicos(arr){ const out=(arr||[]).map(function(p){ return Object.assign({}, p, { site: inferSiteParDinamico(p) }); }); const v=JSON.stringify(out); _kvCache[LS_PARES_PLANT_KEY]=v; localStorage.setItem(LS_PARES_PLANT_KEY, v); kvSet(LS_PARES_PLANT_KEY,v); }
 function getParDinamicoByPlantFr(fr){
   return getParesDinamicos().find(function(p){ return p.plantFr===fr; });
 }
@@ -4581,8 +4675,8 @@ function parseDataFromCSV(){
 function showToast(msg='Alterações salvas'){const t=document.getElementById('toast');t.textContent=`✅ ${msg}`;t.classList.remove('hidden');void t.offsetWidth;t.classList.add('show');setTimeout(()=>{t.classList.remove('show');setTimeout(()=>t.classList.add('hidden'),250);},2000);}
 
 /* ===== Realizados (por dia) ===== */
-function loadRealizadosPorDia(){try{return JSON.parse(localStorage.getItem(LS_REALIZADOS_DIA_KEY)||'{}');}catch(e){return {};}}
-function saveRealizadosPorDia(o){localStorage.setItem(LS_REALIZADOS_DIA_KEY,JSON.stringify(o||{}));}
+function loadRealizadosPorDia(){try{return JSON.parse((_kvCache[LS_REALIZADOS_DIA_KEY]||localStorage.getItem(LS_REALIZADOS_DIA_KEY))||'{}');}catch(e){return {};}}
+function saveRealizadosPorDia(o){const _v=JSON.stringify(o||{});_kvCache[LS_REALIZADOS_DIA_KEY]=_v;localStorage.setItem(LS_REALIZADOS_DIA_KEY,_v);kvSet(LS_REALIZADOS_DIA_KEY,_v);}
 function ensureHojeInicializado(){
   const hoje=ymd(new Date());
   const map=loadRealizadosPorDia();
@@ -4602,22 +4696,22 @@ function tryMigrateLegacyIfToday(dateStr){
 }
 function getHoras(frente,dateStr){tryMigrateLegacyIfToday(dateStr);const map=loadRealizadosPorDia();const dia=map[dateStr]||{};const arr=Array.isArray(dia[frente])?dia[frente]:new Array(24).fill('');return arr.slice(0,24);}
 function setHora(frente,dateStr,h,valor){const map=loadRealizadosPorDia();map[dateStr]=map[dateStr]||{};const arr=Array.isArray(map[dateStr][frente])?map[dateStr][frente]:new Array(24).fill('');arr[h]=valor;map[dateStr][frente]=arr;saveRealizadosPorDia(map);}
-function loadDailyTotals(){try{return JSON.parse(localStorage.getItem(LS_DAILY_KEY)||'{}');}catch(e){return {};}}
-function saveDailyTotals(o){localStorage.setItem(LS_DAILY_KEY,JSON.stringify(o||{}));}
+function loadDailyTotals(){try{return JSON.parse((_kvCache[LS_DAILY_KEY]||localStorage.getItem(LS_DAILY_KEY))||'{}');}catch(e){return {};}}
+function saveDailyTotals(o){const _v=JSON.stringify(o||{});_kvCache[LS_DAILY_KEY]=_v;localStorage.setItem(LS_DAILY_KEY,_v);kvSet(LS_DAILY_KEY,_v);}
 function somaRealizados(frente,dateStr=ymd(new Date())){const arr=getHoras(frente,dateStr);const hoje=ymd(new Date());const limite=(dateStr===hoje)?(new Date().getHours()):23;let sum=0;for(let h=0;h<=limite;h++){const v=parseFloat(String(arr[h]).replace(',','.'));if(!Number.isNaN(v)) sum+=v;}return {soma:sum,horasTrabalhadas:(limite+1)};}
 function totalFrenteDigitado(frente,dateStr){const arr=getHoras(frente,dateStr);let tot=0;for(let h=0;h<24;h++){const v=parseFloat(String(arr[h]).replace(',','.'));if(!Number.isNaN(v)) tot+=v;}return tot;}
 function totalDoDiaDigitado(dateStr=ymd(new Date())){let t=0;getFrentesPlantio().forEach(f=>t+=totalFrenteDigitado(f,dateStr));return t;}
 function projecaoPorFrente(frente,dateStr=ymd(new Date())){const {soma,horasTrabalhadas}=somaRealizados(frente,dateStr);const rest=Math.max(0,24-horasTrabalhadas);const media=horasTrabalhadas>0?soma/horasTrabalhadas:0;return {soma,media,proj:soma+media*rest};}
 
 /* ===== Persistências ===== */
-function loadEquip(){try{return JSON.parse(localStorage.getItem(LS_EQUIP_KEY)||'{}');}catch(e){return {};}}
-function saveEquip(o){localStorage.setItem(LS_EQUIP_KEY,JSON.stringify(o||{}));}
+function loadEquip(){try{const v=_kvCache[LS_EQUIP_KEY]||localStorage.getItem(LS_EQUIP_KEY);return JSON.parse(v||'{}');}catch(e){return {};}}
+function saveEquip(o){const v=JSON.stringify(o||{});_kvCache[LS_EQUIP_KEY]=v;localStorage.setItem(LS_EQUIP_KEY,v);kvSet(LS_EQUIP_KEY,v);}
 
 
 /* ===== Fleet Cards: estados clicáveis (operacional/produtiva/manutenção/cintilação) ===== */
 const LS_FROTA_STATUS_KEY='dashboard_frota_status_v1';
 function loadFrotaStatus(){ try{ return JSON.parse(localStorage.getItem(LS_FROTA_STATUS_KEY)||'{}'); }catch(e){ return {}; } }
-function saveFrotaStatus(o){ try{ localStorage.setItem(LS_FROTA_STATUS_KEY, JSON.stringify(o||{})); }catch(e){} }
+function saveFrotaStatus(o){ try{ const _v=JSON.stringify(o||{});_kvCache[LS_FROTA_STATUS_KEY]=_v;localStorage.setItem(LS_FROTA_STATUS_KEY,_v);kvSet(LS_FROTA_STATUS_KEY,_v); }catch(e){} }
 
 function normStatus(s){
   s=String(s||'').toLowerCase();
@@ -4685,14 +4779,14 @@ function getFrotaStatus(tipo, frente, item, equip){
 
 // ===== Chave para log de tempo de parada =====
 const LS_STATUS_LOG = 'dashboard_status_log_v1';
-function loadStatusLog(){ try{ return JSON.parse(localStorage.getItem(LS_STATUS_LOG)||'[]'); }catch(e){ return []; } }
-function saveStatusLog(arr){ localStorage.setItem(LS_STATUS_LOG, JSON.stringify(arr||[])); }
+function loadStatusLog(){ try{ const v=_kvCache[LS_STATUS_LOG]||localStorage.getItem(LS_STATUS_LOG); return JSON.parse(v||'[]'); }catch(e){ return []; } }
+function saveStatusLog(arr){ const v=JSON.stringify(arr||[]); _kvCache[LS_STATUS_LOG]=v; localStorage.setItem(LS_STATUS_LOG, v); kvSet(LS_STATUS_LOG,v); }
 
 // ===== HORÍMETRO — contador de tempo por equipamento =====
 // Registra o momento em que cada equipamento entrou no status atual
 const LS_HORIMETRO = 'dashboard_horimetro_v1';
 function loadHorimetro(){ try{ return JSON.parse(localStorage.getItem(LS_HORIMETRO)||'{}'); }catch(e){ return {}; } }
-function saveHorimetro(o){ try{ localStorage.setItem(LS_HORIMETRO, JSON.stringify(o||{})); }catch(e){} }
+function saveHorimetro(o){ try{ const _v=JSON.stringify(o||{});_kvCache[LS_HORIMETRO]=_v;localStorage.setItem(LS_HORIMETRO,_v);kvSet(LS_HORIMETRO,_v); }catch(e){} }
 
 // Chave única para identificar o par (tipo, frente, item)
 function _hKey(tipo, frente, item){ return [tipo, frente, String(item).trim()].join('::'); }
@@ -5300,22 +5394,22 @@ function renderFleetCard(chartId){
   return div;
 }
 
-function loadRaio(){try{return JSON.parse(localStorage.getItem(LS_RAIO_KEY)||'{}');}catch(e){return {};}}
-function saveRaio(o){localStorage.setItem(LS_RAIO_KEY,JSON.stringify(o||{}));}
-function loadSafra(){try{return JSON.parse(localStorage.getItem(LS_SAFRA_KEY)||'{}');}catch(e){return {};}}
-function saveSafra(o){localStorage.setItem(LS_SAFRA_KEY,JSON.stringify(o||{}));}
+function loadRaio(){try{const v=_kvCache[LS_RAIO_KEY]||localStorage.getItem(LS_RAIO_KEY);return JSON.parse(v||'{}');}catch(e){return {};}}
+function saveRaio(o){const v=JSON.stringify(o||{});_kvCache[LS_RAIO_KEY]=v;localStorage.setItem(LS_RAIO_KEY,v);kvSet(LS_RAIO_KEY,v);}
+function loadSafra(){try{return JSON.parse((_kvCache[LS_SAFRA_KEY]||localStorage.getItem(LS_SAFRA_KEY))||'{}');}catch(e){return {};}}
+function saveSafra(o){const _v=JSON.stringify(o||{});_kvCache[LS_SAFRA_KEY]=_v;localStorage.setItem(LS_SAFRA_KEY,_v);kvSet(LS_SAFRA_KEY,_v);}
 function getSafraRangeDates(){const cfg=loadSafra()||{};let inicio=cfg?.inicio||'2025-12-01';let fim=cfg?.fim||'2026-11-30';if(!/^\d{4}-\d{2}-\d{2}$/.test(inicio)) inicio='2025-12-01';if(!/^\d{4}-\d{2}-\d{2}$/.test(fim)) fim='2026-11-30';const dIni=new Date(inicio+'T00:00:00');const dFim=new Date(fim+'T23:59:59.999');if(!(dIni<dFim)) return {inicio:new Date('2025-12-01T00:00:00'),fim:new Date('2026-11-30T23:59:59.999'),inicioStr:'2025-12-01',fimStr:'2026-11-30'};return {inicio:dIni,fim:dFim,inicioStr:inicio,fimStr:fim};}
-function loadVel(){try{return JSON.parse(localStorage.getItem(LS_VEL_KEY)||'{}');}catch(e){return {};}}
-function saveVel(o){localStorage.setItem(LS_VEL_KEY,JSON.stringify(o||{}));}
+function loadVel(){try{return JSON.parse((_kvCache[LS_VEL_KEY]||localStorage.getItem(LS_VEL_KEY))||'{}');}catch(e){return {};}}
+function saveVel(o){const _v=JSON.stringify(o||{});_kvCache[LS_VEL_KEY]=_v;localStorage.setItem(LS_VEL_KEY,_v);kvSet(LS_VEL_KEY,_v);}
 
 /* ===== Curadoria & Filtros ===== */
 function getSectionToggles(data){const secs=uniq(data.filter(d=>d.tipo==='SERIE').map(d=>d.secao||'Geral')); if(!secs.includes('Operação Diária')) secs.push('Operação Diária'); if(!secs.includes('Recursos')) secs.push('Recursos'); return secs;}
-function loadSections(){try{return JSON.parse(localStorage.getItem(LS_SECTIONS_KEY)||'{}');}catch(e){return {};}}
-function saveSections(m){localStorage.setItem(LS_SECTIONS_KEY,JSON.stringify(m||{}));}
+function loadSections(){try{return JSON.parse((_kvCache[LS_SECTIONS_KEY]||localStorage.getItem(LS_SECTIONS_KEY))||'{}');}catch(e){return {};}}
+function saveSections(m){const _v=JSON.stringify(m||{});_kvCache[LS_SECTIONS_KEY]=_v;localStorage.setItem(LS_SECTIONS_KEY,_v);kvSet(LS_SECTIONS_KEY,_v);}
 function ensureSectionsDefaults(secoes){const map=loadSections();let ch=false;secoes.forEach(s=>{if(map[s]===undefined){map[s]=true;ch=true;}}); if(ch) saveSections(map); return map;}
 function renderCuradoriaUI(data){const secs=getSectionToggles(data);ensureSectionsDefaults(secs);const box=document.getElementById('curadoriaSecoes');if(box)box.innerHTML='';}
-function loadChartsFilter(){try{return JSON.parse(localStorage.getItem(LS_CHARTS_KEY)||'{}');}catch(e){return {};}}
-function saveChartsFilter(m){localStorage.setItem(LS_CHARTS_KEY,JSON.stringify(m||{}));}
+function loadChartsFilter(){try{return JSON.parse((_kvCache[LS_CHARTS_KEY]||localStorage.getItem(LS_CHARTS_KEY))||'{}');}catch(e){return {};}}
+function saveChartsFilter(m){const _v=JSON.stringify(m||{});_kvCache[LS_CHARTS_KEY]=_v;localStorage.setItem(LS_CHARTS_KEY,_v);kvSet(LS_CHARTS_KEY,_v);}
 function ensureChartsDefaults(ids){const m=loadChartsFilter();let ch=false;ids.forEach(id=>{if(m[id]===undefined){m[id]=true;ch=true;}}); if(ch) saveChartsFilter(m); return m;}
 
 /* ===== KPIs ===== */
@@ -5403,8 +5497,8 @@ function openEquipModal(tipo, frente) {
 
 
 /* ===== Drag & Drop ordem ===== */
-function loadChartOrder(){try{return JSON.parse(localStorage.getItem(LS_CHART_ORDER_KEY)||'[]');}catch(e){return [];}}
-function saveChartOrder(a){localStorage.setItem(LS_CHART_ORDER_KEY,JSON.stringify(Array.isArray(a)?a:[]));}
+function loadChartOrder(){try{return JSON.parse((_kvCache[LS_CHART_ORDER_KEY]||localStorage.getItem(LS_CHART_ORDER_KEY))||'[]');}catch(e){return [];}}
+function saveChartOrder(a){const _v=JSON.stringify(Array.isArray(arguments[0])?arguments[0]:[]);_kvCache[LS_CHART_ORDER_KEY]=_v;localStorage.setItem(LS_CHART_ORDER_KEY,_v);kvSet(LS_CHART_ORDER_KEY,_v);}
 function applySavedOrder(ids){const ord=loadChartOrder();if(!Array.isArray(ord)||ord.length===0) return ids.slice();const idx=id=>{const i=ord.indexOf(id);return i===-1?1e9:i;};return ids.slice().sort((a,b)=>idx(a)-idx(b));}
 function persistCurrentOrderFromDOM(){const ids=Array.from(document.querySelectorAll('#charts .chart')).map(el=>el?.dataset?.chartId).filter(Boolean);saveChartOrder(ids);}
 function attachReorderTools(card){const tools=document.createElement('div');tools.className='reorder-tools';tools.innerHTML=`<button class="btn-up" title="Mover para cima">▲</button><button class="btn-down" title="Mover para baixo">▼</button>`;card.insertBefore(tools,card.firstChild);const up=tools.querySelector('.btn-up'),down=tools.querySelector('.btn-down');up.addEventListener('click',()=>{const prev=card.previousElementSibling;if(prev) card.parentNode.insertBefore(card,prev);persistCurrentOrderFromDOM();});down.addEventListener('click',()=>{const next=card.nextElementSibling;if(next) card.parentNode.insertBefore(next,card);persistCurrentOrderFromDOM();});}
@@ -5413,7 +5507,7 @@ function makeChartDraggable(card,id){if(!card) return;card.dataset.chartId=id;ca
 
 /* ===== Modo edição de ordem ===== */
 function loadOrderEditMode(){return localStorage.getItem(LS_ORDER_EDIT_KEY)==='1';}
-function saveOrderEditMode(f){localStorage.setItem(LS_ORDER_EDIT_KEY,f?'1':'0');}
+function saveOrderEditMode(f){const _v=f?'1':'0';_kvCache[LS_ORDER_EDIT_KEY]=_v;localStorage.setItem(LS_ORDER_EDIT_KEY,_v);kvSet(LS_ORDER_EDIT_KEY,_v);}
 let isOrderEditMode=loadOrderEditMode();
 function applyOrderEditModeUI(){document.body.classList.toggle('order-edit-mode',isOrderEditMode);const btn=document.getElementById('btnToggleOrder');if(btn) btn.classList.toggle('active',isOrderEditMode);document.querySelectorAll('#charts .chart.draggable-chart').forEach(el=>el.setAttribute('draggable',isOrderEditMode?'true':'false'));}
 
@@ -6340,8 +6434,8 @@ function getParamFrentes(){
 }
 // Alias de compatibilidade (usado em forEach)
 var PARAM_FRENTES=['F34','F36']; // será sobrescrito abaixo dinamicamente
-function loadParams(){try{return JSON.parse(localStorage.getItem(LS_PARAMS_KEY)||'{}');}catch(e){return {};}}
-function saveParams(o){localStorage.setItem(LS_PARAMS_KEY,JSON.stringify(o||{}));}
+function loadParams(){try{return JSON.parse((_kvCache[LS_PARAMS_KEY]||localStorage.getItem(LS_PARAMS_KEY))||'{}');}catch(e){return {};}}
+function saveParams(o){const _v=JSON.stringify(o||{});_kvCache[LS_PARAMS_KEY]=_v;localStorage.setItem(LS_PARAMS_KEY,_v);kvSet(LS_PARAMS_KEY,_v);}
 function ensureParamsDefaults(){
   const p=loadParams();
   PARAM_FRENTES.forEach(fr=>{
@@ -6386,8 +6480,8 @@ function recomputeTotalsWithin(container){
 }
 
 /* Capacidades (T) + Tempos do GRUNNER por F39/34 e F41/36 */
-function loadCaps(){try{return JSON.parse(localStorage.getItem(LS_CAP_KEY)||'{}');}catch(e){return {};}}
-function saveCaps(o){localStorage.setItem(LS_CAP_KEY,JSON.stringify(o||{}));}
+function loadCaps(){try{return JSON.parse((_kvCache[LS_CAP_KEY]||localStorage.getItem(LS_CAP_KEY))||'{}');}catch(e){return {};}}
+function saveCaps(o){const _v=JSON.stringify(o||{});_kvCache[LS_CAP_KEY]=_v;localStorage.setItem(LS_CAP_KEY,_v);kvSet(LS_CAP_KEY,_v);}
 function ensureCapsDefaults(){
   const c=loadCaps();
   c['F39_34']=c['F39_34']||{PLANTADORA:'',GRUNNER:'',RODOMUDA:'',MULTICARGA:'',
@@ -6399,7 +6493,7 @@ function ensureCapsDefaults(){
 }
 
 function loadMetaDia(){ try{ return JSON.parse(localStorage.getItem(LS_META_DIA_KEY)||'{}'); }catch(e){ return {}; } }
-function saveMetaDia(map){ localStorage.setItem(LS_META_DIA_KEY, JSON.stringify(map||{})); }
+function saveMetaDia(map){ const _v=JSON.stringify(map||{});_kvCache[LS_META_DIA_KEY]=_v;localStorage.setItem(LS_META_DIA_KEY,_v);kvSet(LS_META_DIA_KEY,_v); }
 function getMetaDiaLS(fr){ const m=loadMetaDia(); const v=m?.[fr]; const n=parseFloat(String(v).replace(',','.')); return Number.isNaN(n)?null:n; }
 // ===== Config: Meta do Dia PLANTIO (frentes dinâmicas + F38IRRI) =====
 function montarMetaDiaUI(){
@@ -6451,7 +6545,7 @@ function montarMetaDiaUI(){
   // Meta Safra Plantio (dashboard_meta_safra_v1 se existir, senão só meta dia)
   const LS_SAFRA_PLANT = 'dashboard_meta_safra_plantio_v1';
   function loadSafraPlant(){ try{ return JSON.parse(localStorage.getItem(LS_SAFRA_PLANT)||'{}'); }catch(e){ return {}; } }
-  function saveSafraPlant(m){ localStorage.setItem(LS_SAFRA_PLANT, JSON.stringify(m||{})); }
+  function saveSafraPlant(m){ const _v=JSON.stringify(m||{});_kvCache[LS_SAFRA_PLANT]=_v;localStorage.setItem(LS_SAFRA_PLANT,_v);kvSet(LS_SAFRA_PLANT,_v); }
 
   mkSep('🌱 Plantio — Metas por Frente');
   frs.forEach(fr => {
@@ -6461,7 +6555,7 @@ function montarMetaDiaUI(){
       // F38IRRI usa chave própria
       const LS_IRRI_META = 'dashboard_f38irri_meta_dia_v1';
       function loadIrriMeta(){ try{ return JSON.parse(localStorage.getItem(LS_IRRI_META)||'{}'); }catch(e){ return {}; } }
-      function saveIrriMeta(m){ localStorage.setItem(LS_IRRI_META, JSON.stringify(m||{})); }
+      function saveIrriMeta(m){ const _v=JSON.stringify(m||{});_kvCache[LS_IRRI_META]=_v;localStorage.setItem(LS_IRRI_META,_v);kvSet(LS_IRRI_META,_v); }
       mkRow('F38IRRI', LS_IRRI_META, loadIrriMeta, saveIrriMeta, '💧 Meta do Dia F38 Irrigação (ha):', true);
     } else {
       mkRow(fr, LS_META_DIA_KEY, loadMetaDia, saveMetaDia, `Meta do Dia ${fr} (ha):`, false);
@@ -6501,7 +6595,7 @@ function montarDashboardPCMeta(){
   var KEY_BRIDGE  = 'dashboard_pc_kpis_v1';
 
   function loadBridge(){ try{ return JSON.parse(localStorage.getItem(KEY_BRIDGE)||'{}'); }catch(e){ return {}; } }
-  function saveBridge(m){ localStorage.setItem(KEY_BRIDGE, JSON.stringify(m||{})); }
+  function saveBridge(m){ const _v=JSON.stringify(m||{});_kvCache[KEY_BRIDGE]=_v;localStorage.setItem(KEY_BRIDGE,_v);kvSet(KEY_BRIDGE,_v); }
 
   var fields = [
     { id:'meta_safra_preparo',  lsKey: LS_MS_PREP,  label:'Meta Safra — PREPARO (ha)',     color:'#0369a1', op:'preparo'  },
@@ -6520,7 +6614,7 @@ function montarDashboardPCMeta(){
     inp.addEventListener('input', function(){
       var v = String(inp.value).replace(',','.');
       // Grava na chave principal do KPI
-      localStorage.setItem(f.lsKey, v);
+      _kvCache[f.lsKey]=v; localStorage.setItem(f.lsKey, v); kvSet(f.lsKey,v);
       // Grava também no bridge (compatibilidade)
       var m = loadBridge(); m[f.id] = v; saveBridge(m);
       // Atualiza o render do Preparo/Composto
@@ -6568,7 +6662,7 @@ function montarMetaDiaPC_UI(){
       inp.value=(metas && metas[fr])?metas[fr]:'';
       inp.oninput=function(){
         var m={}; try{ m=JSON.parse(localStorage.getItem(key)||'{}'); }catch(e){ m={}; }
-        m[fr]=String(inp.value).replace(',','.'); localStorage.setItem(key, JSON.stringify(m));
+        m[fr]=String(inp.value).replace(',','.'); const _v2=JSON.stringify(m); _kvCache[key]=_v2; localStorage.setItem(key, _v2); kvSet(key,_v2);
         if(typeof pc_render==='function') pc_render(key.indexOf('preparo')!==-1?'preparo':'composto');
       };
       row.appendChild(lab); row.appendChild(inp); bx.appendChild(row);
@@ -6764,12 +6858,12 @@ function montarConfigEquipamentos(){
 
   function getFrentes(lsKey,def){try{var a=JSON.parse(localStorage.getItem(lsKey)||'[]');return(Array.isArray(a)&&a.length)?a:def.slice();}catch(e){return def.slice();}}
   function saveFrentes(lsKey,arr){
-    localStorage.setItem(lsKey,JSON.stringify(arr));
+    {const _v=JSON.stringify(arr);_kvCache[lsKey]=_v;localStorage.setItem(lsKey,_v);kvSet(lsKey,_v);}
     // Plantadoras: sincroniza com dashboard_frentes_v1 (chave usada por getFrentesPlantio)
     if(lsKey===LS_PLANT_FR){
       // Mantém só as frentes de plantio reais (sem F38IRRI)
       var plantArr=arr.filter(function(f){return f!=='F38IRRI';});
-      localStorage.setItem('dashboard_frentes_v1', JSON.stringify(plantArr));
+      {const _v=JSON.stringify(plantArr);_kvCache['dashboard_frentes_v1']=_v;localStorage.setItem('dashboard_frentes_v1',_v);kvSet('dashboard_frentes_v1',_v);}
     }
     if(typeof CHART_EQUIP_MAP!=='undefined'){
       if(lsKey===LS_PLANT_FR) CHART_EQUIP_MAP['plantadora']=arr.slice();
@@ -6830,8 +6924,8 @@ function montarConfigEquipamentos(){
               var LS_PLANT_FR2='dashboard_frentes_plantadora_v1';
               // Preparo / Composto: limpar potencial e meta
               if(lsK===LS_PREP_FR2 || lsK===LS_COMP_FR2){
-                try{ var potObj=JSON.parse(localStorage.getItem('dashboard_potencial_pc_v1')||'{}'); delete potObj[frR]; localStorage.setItem('dashboard_potencial_pc_v1',JSON.stringify(potObj)); }catch(e){}
-                ['dashboard_preparo_meta_dia_v1','dashboard_composto_meta_dia_v1'].forEach(function(mk){ try{ var mObj=JSON.parse(localStorage.getItem(mk)||'{}'); delete mObj[frR]; localStorage.setItem(mk,JSON.stringify(mObj)); }catch(e){} });
+                try{ var potObj=JSON.parse(localStorage.getItem('dashboard_potencial_pc_v1')||'{}'); delete potObj[frR]; const __v1=JSON.stringify(potObj);_kvCache['dashboard_potencial_pc_v1']=__v1;localStorage.setItem('dashboard_potencial_pc_v1',__v1);kvSet('dashboard_potencial_pc_v1',__v1); }catch(e){}
+                ['dashboard_preparo_meta_dia_v1','dashboard_composto_meta_dia_v1'].forEach(function(mk){ try{ var mObj=JSON.parse(localStorage.getItem(mk)||'{}'); delete mObj[frR]; const __v2=JSON.stringify(mObj);_kvCache[mk]=__v2;localStorage.setItem(mk,__v2);kvSet(mk,__v2); }catch(e){} });
                 if(Array.isArray(window._rowsForPlot)){ window._rowsForPlot=window._rowsForPlot.filter(function(r){return !(r.chart==='Potencial'&&r.categoria===frR);}); }
               }
               // Plantadora: limpar par dinâmico e todos os dados associados
@@ -6844,19 +6938,19 @@ function montarConfigEquipamentos(){
                     var capKeyR=par.capKey;
                     // remove par
                     pares=pares.filter(function(p){return p.plantFr!==frR && p.colhFr!==frR;});
-                    localStorage.setItem('dashboard_pares_plantio_v1',JSON.stringify(pares));
+                    const __v3=JSON.stringify(pares);_kvCache['dashboard_pares_plantio_v1']=__v3;localStorage.setItem('dashboard_pares_plantio_v1',__v3);kvSet('dashboard_pares_plantio_v1',__v3);
                     // remove colhFr from colhedora & grunner lists
                     ['dashboard_frentes_colhedora_v1','dashboard_frentes_grunner_v1'].forEach(function(lk){
-                      try{ var arr=JSON.parse(localStorage.getItem(lk)||'[]'); arr=arr.filter(function(f){return f!==colhFrR;}); localStorage.setItem(lk,JSON.stringify(arr)); }catch(e){}
+                      try{ var arr=JSON.parse(localStorage.getItem(lk)||'[]'); arr=arr.filter(function(f){return f!==colhFrR;}); const __v4=JSON.stringify(arr);_kvCache[lk]=__v4;localStorage.setItem(lk,__v4);kvSet(lk,__v4); }catch(e){}
                     });
                     // remove params for both frentes
-                    try{ var params=JSON.parse(localStorage.getItem('dashboard_parametros_v1')||'{}'); delete params[frR]; delete params[colhFrR]; localStorage.setItem('dashboard_parametros_v1',JSON.stringify(params)); }catch(e){}
+                    try{ var params=JSON.parse(localStorage.getItem('dashboard_parametros_v1')||'{}'); delete params[frR]; delete params[colhFrR]; const __v5=JSON.stringify(params);_kvCache['dashboard_parametros_v1']=__v5;localStorage.setItem('dashboard_parametros_v1',__v5);kvSet('dashboard_parametros_v1',__v5); }catch(e){}
                     // remove cap equip entry
-                    try{ var caps=JSON.parse(localStorage.getItem('dashboard_cap_equip_v1')||'{}'); delete caps[capKeyR]; localStorage.setItem('dashboard_cap_equip_v1',JSON.stringify(caps)); }catch(e){}
+                    try{ var caps=JSON.parse(localStorage.getItem('dashboard_cap_equip_v1')||'{}'); delete caps[capKeyR]; const __v6=JSON.stringify(caps);_kvCache['dashboard_cap_equip_v1']=__v6;localStorage.setItem('dashboard_cap_equip_v1',__v6);kvSet('dashboard_cap_equip_v1',__v6); }catch(e){}
                     // remove from pares tempo
-                    try{ var pTempo=JSON.parse(localStorage.getItem('dashboard_pares_tempo_v1')||'[]'); pTempo=pTempo.filter(function(p){return p.plantFr!==frR&&p.colhFr!==frR&&p.plantFr!==colhFrR&&p.colhFr!==colhFrR;}); localStorage.setItem('dashboard_pares_tempo_v1',JSON.stringify(pTempo)); }catch(e){}
+                    try{ var pTempo=JSON.parse(localStorage.getItem('dashboard_pares_tempo_v1')||'[]'); pTempo=pTempo.filter(function(p){return p.plantFr!==frR&&p.colhFr!==frR&&p.plantFr!==colhFrR&&p.colhFr!==colhFrR;}); const __v7=JSON.stringify(pTempo);_kvCache['dashboard_pares_tempo_v1']=__v7;localStorage.setItem('dashboard_pares_tempo_v1',__v7);kvSet('dashboard_pares_tempo_v1',__v7); }catch(e){}
                     // remove colhFr from equip (grunner_pm) so it disappears from Dimensionamento
-                    try{ var eqDel=JSON.parse(localStorage.getItem('dashboard_equip_v1')||'{}'); if(eqDel.grunner_pm){ delete eqDel.grunner_pm[colhFrR]; localStorage.setItem('dashboard_equip_v1',JSON.stringify(eqDel)); } }catch(e){}
+                    try{ var eqDel=JSON.parse(localStorage.getItem('dashboard_equip_v1')||'{}'); if(eqDel.grunner_pm){ delete eqDel.grunner_pm[colhFrR]; const __v8=JSON.stringify(eqDel);_kvCache['dashboard_equip_v1']=__v8;localStorage.setItem('dashboard_equip_v1',__v8);kvSet('dashboard_equip_v1',__v8); } }catch(e){}
                     // also remove colhFr from Potencial rowsForPlot
                     if(Array.isArray(window._rowsForPlot)){ window._rowsForPlot=window._rowsForPlot.filter(function(r){return !(r.chart==='Potencial'&&(r.categoria===colhFrR||r.categoria===frR));}); }
                   }
@@ -7015,7 +7109,7 @@ function buildRealizadosUI(){
   const FRENTES_COM_RAIO = ['F34','F36'];
 
   function loadMapa(key){ try{ return JSON.parse(localStorage.getItem(key)||'{}'); }catch(e){ return {}; } }
-  function saveMapa(key,o){ localStorage.setItem(key,JSON.stringify(o||{})); }
+  function saveMapa(key,o){ const _v=JSON.stringify(o||{});_kvCache[key]=_v;localStorage.setItem(key,_v);kvSet(key,_v); }
 
   function getArr(key,fr,dia){
     const m=loadMapa(key); const d=m[dia]||{}; const a=d[fr];
@@ -7206,7 +7300,7 @@ function buildRealizadosUI(){
   const toNum = v => { const n = parseFloat(String(v).replace(',','.')); return Number.isNaN(n) ? 0 : n; };
   const ymd = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   function loadMap(key){ try{ return JSON.parse(localStorage.getItem(key) || '{}'); }catch(e){ return {}; } }
-  function saveMap(key, o){ localStorage.setItem(key, JSON.stringify(o || {})); }
+  function saveMap(key, o){ const _v=JSON.stringify(o||{});_kvCache[key]=_v;localStorage.setItem(key,_v);kvSet(key,_v); }
   function ensureHoje(key, frentes){ const dia = ymd(new Date()); const map = loadMap(key); if(!map[dia]){ map[dia] = {}; } frentes.forEach(f=>{ if(!Array.isArray(map[dia][f])) map[dia][f] = new Array(24).fill(''); }); saveMap(key, map); }
   function getHoras(key, frente, dateStr){ const map = loadMap(key); const dia = map[dateStr] || {}; const arr = Array.isArray(dia[frente]) ? dia[frente] : new Array(24).fill(''); return arr.slice(0,24); }
   function setHora(key, frente, dateStr, h, valor){ const map = loadMap(key); map[dateStr] = map[dateStr] || {}; const arr = Array.isArray(map[dateStr][frente]) ? map[dateStr][frente] : new Array(24).fill(''); arr[h] = valor; map[dateStr][frente] = arr; saveMap(key, map); }
@@ -7222,7 +7316,7 @@ function buildRealizadosUI(){
     const lsRestrKey = storeKey.replace('_realizados_por_dia_v1','_restritivo_v1');
     const lsObsKey   = storeKey.replace('_realizados_por_dia_v1','_obs_v1');
     function loadMap2(k){ try{ return JSON.parse(localStorage.getItem(k)||'{}'); }catch(e){ return {}; } }
-    function saveMap2(k,o){ localStorage.setItem(k,JSON.stringify(o||{})); }
+    function saveMap2(k,o){ const _v=JSON.stringify(o||{});_kvCache[k]=_v;localStorage.setItem(k,_v);kvSet(k,_v); }
     function getArr2(k,fr,d){ const m=loadMap2(k); const dd=m[d]||{}; const a=dd[fr]; return Array.isArray(a)?a.slice(0,24):new Array(24).fill(''); }
     function setVal2(k,fr,d,h,v){ const m=loadMap2(k); m[d]=m[d]||{}; const a=Array.isArray(m[d][fr])?m[d][fr]:new Array(24).fill(''); a[h]=v; m[d][fr]=a; saveMap2(k,m); }
 
@@ -7286,7 +7380,7 @@ btnConfig.onclick=()=>{
     var pArr=JSON.parse(localStorage.getItem('dashboard_frentes_plantadora_v1')||'[]');
     if(Array.isArray(pArr)&&pArr.length){
       var cleaned=pArr.filter(function(f){return f!=='F38IRRI';});
-      if(cleaned.length) localStorage.setItem('dashboard_frentes_v1',JSON.stringify(cleaned));
+      if(cleaned.length){const _v=JSON.stringify(cleaned);_kvCache['dashboard_frentes_v1']=_v;localStorage.setItem('dashboard_frentes_v1',_v);kvSet('dashboard_frentes_v1',_v);}
     }
   }catch(e){}
 })();
@@ -7319,16 +7413,16 @@ function salvarConfiguracoes(data){
     data.forEach(row=>{const cols=header.map(h=>(row[h]??''));linhas.push(cols.join(','));});
     return linhas.join('\n');
   })();
-  document.getElementById('csvData').textContent=updatedCSV; localStorage.setItem(LS_CSV_KEY,updatedCSV);
+  document.getElementById('csvData').textContent=updatedCSV; _kvCache[LS_CSV_KEY]=updatedCSV; localStorage.setItem(LS_CSV_KEY,updatedCSV); kvSet(LS_CSV_KEY,updatedCSV);
 
-  const r1=document.getElementById('inpRaio3439')?.value??''; const r2=document.getElementById('inpRaio3641')?.value??''; localStorage.setItem(LS_RAIO_KEY, JSON.stringify({r3439:r1,r3641:r2}));
+  const r1=document.getElementById('inpRaio3439')?.value??''; const r2=document.getElementById('inpRaio3641')?.value??''; {const _v=JSON.stringify({r3439:r1,r3641:r2});_kvCache[LS_RAIO_KEY]=_v;localStorage.setItem(LS_RAIO_KEY,_v);kvSet(LS_RAIO_KEY,_v);}
   const ini=document.getElementById('inpSafraInicio')?.value; const fim=document.getElementById('inpSafraFim')?.value;
   if(ini&&fim){
     const dIni=new Date(ini+'T00:00:00'); const dFim=new Date(fim+'T23:59:59.999');
-    if(dIni<dFim){localStorage.setItem(LS_SAFRA_KEY, JSON.stringify({inicio:ini,fim:fim}));}
+    if(dIni<dFim){const _v=JSON.stringify({inicio:ini,fim:fim});_kvCache[LS_SAFRA_KEY]=_v;localStorage.setItem(LS_SAFRA_KEY,_v);kvSet(LS_SAFRA_KEY,_v);}
     else {showToast('Período de Safra inválido — mantendo anterior');}
   }
-  const v39c=document.getElementById('inpVelF39C')?.value??''; const v39v=document.getElementById('inpVelF39V')?.value??''; const v41c=document.getElementById('inpVelF41C')?.value??''; const v41v=document.getElementById('inpVelF41V')?.value??''; localStorage.setItem(LS_VEL_KEY, JSON.stringify({F39C:v39c,F39V:v39v,F41C:v41c,F41V:v41v}));
+  const v39c=document.getElementById('inpVelF39C')?.value??''; const v39v=document.getElementById('inpVelF39V')?.value??''; const v41c=document.getElementById('inpVelF41C')?.value??''; const v41v=document.getElementById('inpVelF41V')?.value??''; {const _v=JSON.stringify({F39C:v39c,F39V:v39v,F41C:v41c,F41V:v41v});_kvCache[LS_VEL_KEY]=_v;localStorage.setItem(LS_VEL_KEY,_v);kvSet(LS_VEL_KEY,_v);}
 
   document.querySelectorAll('#paramsWrap .param-block, #paramsWrap .param-col').forEach(c=>recomputeTotalsWithin(c));
 
@@ -7658,7 +7752,7 @@ document.addEventListener("DOMContentLoaded", function(){
     // remove classes legadas caso existam
     document.body.classList.remove('theme-militar','theme-militar-dark');
     document.body.classList.toggle('theme-escuro', mode==='escuro');
-    try{ localStorage.setItem(KEY, mode); }catch(e){}
+    try{ localStorage.setItem(KEY, mode); if(!["modo_gestor","theme","configTab"].includes(KEY)){kvSet(KEY,mode);} }catch(e){}
     const btn=document.getElementById('btnTheme'); if(btn) btn.textContent = labels[mode] || 'Tema';
   }
   function current(){ try{ return localStorage.getItem(KEY) || 'default'; }catch(e){ return 'default'; } }
@@ -7867,7 +7961,7 @@ if (typeof Chart !== "undefined") {
 </div>
 
 
-<script>(function(){const P='dashboard_parametros_v1',C='dashboard_cap_equip_v1',V='dashboard_vel_grunner_v1',R='dashboard_raio_v1';const toNum=v=>{const x=parseFloat(String(v).replace(',', '.'));return Number.isFinite(x)?x:0};const f2=v=>(Number(v)||0).toFixed(2);function load(k){try{return JSON.parse(localStorage.getItem(k)||'{}')}catch(e){return{}}}function save(k,o){localStorage.setItem(k,JSON.stringify(o||{}))}function ensure(){const p=load(P),c=load(C),v=load(V),r=load(R);['F34','F36','F39','F41'].forEach(fr=>{p[fr]=p[fr]||{};p[fr].plantadora=p[fr].plantadora||{tempo_plantio_min:'',abastecimento_muda_min:'',abastecimento_insumo_min:'',total_min:''};p[fr].colhedora=p[fr].colhedora||{tempo_colheita_min:'',capacidade_tt:'',toneladas_por_ha:'',toneladas_por_hora:''}});const vv=Object.assign({F39C:'',F39V:'',F41C:'',F41V:''},v||{});const rr=Object.assign({r3439:'',r3641:''},r||{});c['F39_34']=c['F39_34']||{PLANTADORA:'',GRUNNER:'',RODOMUDA:'',MULTICARGA:'',GRUNNER_TEMPO_CARREGADO_MIN:'',GRUNNER_TEMPO_VAZIO_MIN:''};c['F41_36']=c['F41_36']||{PLANTADORA:'',GRUNNER:'',RODOMUDA:'',MULTICARGA:'',GRUNNER_TEMPO_CARREGADO_MIN:'',GRUNNER_TEMPO_VAZIO_MIN:''};save(P,p);save(C,c);save(V,vv);save(R,rr);return{p,c,v:vv,r:rr}}function inputRow(label,value,oninput,opts={}){const row=document.createElement('div');row.className='param-row';row.style.display='grid';row.style.gridTemplateColumns='minmax(260px,1fr) 220px';row.style.gap='8px';const lab=document.createElement('div');lab.className='label';lab.textContent=label;const inp=document.createElement('input');inp.type=opts.type||'text';inp.inputMode='decimal';inp.value=(value!=null?String(value):'');if(opts.readonly){inp.readOnly=true;inp.tabIndex=-1;inp.style.background='#f8fafc'}['input','change','blur'].forEach(ev=>inp.addEventListener(ev,()=>oninput(inp.value)));row.appendChild(lab);row.appendChild(inp);return{row,inp}}const bloco=t=>{const b=document.createElement('div');b.className='param-block';const h=document.createElement('div');h.className='block-title';h.textContent=t;b.appendChild(h);return b};const card=t=>{const c=document.createElement('div');c.className='params-card';c.innerHTML='<h4>'+t+'</h4>';return c};function montarPar(container,cfg){const {p,c,v,r}=ensure();const fC=cfg.colheitaFr,fP=cfg.plantioFr,raioKey=cfg.raioKey,capKey=cfg.capKey,velC=cfg.velC,velV=cfg.velV;const wrap=card(cfg.titulo);const bColh=bloco('Colheita — '+fC);const r_tcol=inputRow('Tempo de colheita (min)',p[fC].colhedora.tempo_colheita_min,val=>{p[fC].colhedora.tempo_colheita_min=val;save(P,p);recompute()});const r_tt=inputRow('Capacidade T.T',p[fC].colhedora.capacidade_tt,val=>{p[fC].colhedora.capacidade_tt=val;save(P,p)});const r_tonha=inputRow('Toneladas por ha',p[fC].colhedora.toneladas_por_ha,val=>{p[fC].colhedora.toneladas_por_ha=val;save(P,p);recompute()});bColh.appendChild(r_tcol.row);bColh.appendChild(r_tt.row);bColh.appendChild(r_tonha.row);const bPlant=bloco('Plantio — '+fP);const p_tp=inputRow('Tempo de Plantio (min)',p[fP].plantadora.tempo_plantio_min,val=>{p[fP].plantadora.tempo_plantio_min=val;save(P,p);recomputeTotal()});const p_am=inputRow('Abastecimento de Muda (min)',p[fP].plantadora.abastecimento_muda_min,val=>{p[fP].plantadora.abastecimento_muda_min=val;save(P,p);recomputeTotal()});const p_ai=inputRow('Abastecimento de Insumo (min)',p[fP].plantadora.abastecimento_insumo_min,val=>{p[fP].plantadora.abastecimento_insumo_min=val;save(P,p);recomputeTotal()});const p_tot=inputRow('Total ciclo (min)',p[fP].plantadora.total_min,()=>{}, {readonly:true,type:'text'});function recomputeTotal(){const tot=toNum(p[fP].plantadora.tempo_plantio_min)+toNum(p[fP].plantadora.abastecimento_muda_min)+toNum(p[fP].plantadora.abastecimento_insumo_min);p[fP].plantadora.total_min=String(tot);p_tot.inp.value=f2(tot);save(P,p)}bPlant.appendChild(p_tp.row);bPlant.appendChild(p_am.row);bPlant.appendChild(p_ai.row);bPlant.appendChild(p_tot.row);const bGru=bloco('Grunner');const g_vc=inputRow('Velocidade Carregado (km/h)',v[velC],raw=>{v[velC]=String(raw).replace(',','.');save(V,v);recompute()});const g_vv=inputRow('Velocidade Vazio (km/h)',v[velV],raw=>{v[velV]=String(raw).replace(',','.');save(V,v);recompute()});const g_dst=inputRow('Distância (km)',r[raioKey],raw=>{r[raioKey]=String(raw).replace(',','.');save(R,r);recompute();window.Dim_refreshFromFrente&&window.Dim_refreshFromFrente()});const permKey='perm_'+raioKey;const g_perm=inputRow('Tempo Permanência no Dimensionamento (min)',r[permKey]||'',raw=>{r[permKey]=String(raw).replace(',','.');save(R,r);window.Dim_refreshFromFrente&&window.Dim_refreshFromFrente()});const g_tc=inputRow('Tempo Carregado (min)',c[capKey].GRUNNER_TEMPO_CARREGADO_MIN,()=>{}, {readonly:true,type:'text'});const g_tv=inputRow('Tempo Vazio (min)',c[capKey].GRUNNER_TEMPO_VAZIO_MIN,()=>{}, {readonly:true,type:'text'});const g_vv2=inputRow('Velocidade vazio x 2', '', ()=>{}, {readonly:true,type:'text'});const g_tcolInfo=inputRow('Tempo colheita '+fC+' (min)', '', ()=>{}, {readonly:true,type:'text'});const g_ciclo=inputRow('Ciclo (min) = (velocidade vazio*2) + Tempo colheita '+fC+' + Tempo Carregado + Tempo Vazio','',()=>{}, {readonly:true,type:'text'});bGru.appendChild(g_vc.row);bGru.appendChild(g_vv.row);bGru.appendChild(g_dst.row);bGru.appendChild(g_perm.row);bGru.appendChild(g_tc.row);bGru.appendChild(g_tv.row);bGru.appendChild(g_vv2.row);bGru.appendChild(g_tcolInfo.row);bGru.appendChild(g_ciclo.row);const bCap=bloco('Capacidade Equipamentos (T) — '+fP+'/'+fC);const capP=inputRow('Plantadora',c[capKey].PLANTADORA,val=>{c[capKey].PLANTADORA=val;save(C,c)});const capG=inputRow('Grunner',c[capKey].GRUNNER,val=>{c[capKey].GRUNNER=val;save(C,c);recompute()});bCap.appendChild(capP.row);bCap.appendChild(capG.row);const bPot=bloco('Potencial Grunner '+fC+' — Fórmula: 60 / Ciclo Grunner '+fC+' × Cap. Grunner ÷ Ton/ha '+fC);const potV=inputRow('Potencial = (60 / ciclo) * Cap. Grunner / Ton/ha '+fC,'',()=>{}, {readonly:true,type:'text'});bPot.appendChild(potV.row);wrap.appendChild(bColh);wrap.appendChild(bPlant);wrap.appendChild(bGru);wrap.appendChild(bCap);wrap.appendChild(bPot);container.appendChild(wrap);function recompute(){const dist=toNum(r[raioKey]);const vc=toNum(v[velC]);const vv=toNum(v[velV]);const tc=(dist>0&&vc>0)?(dist/vc)*60:0;const tv=(dist>0&&vv>0)?(dist/vv)*60:0;c[capKey].GRUNNER_TEMPO_CARREGADO_MIN=String(tc);c[capKey].GRUNNER_TEMPO_VAZIO_MIN=String(tv);g_tc.inp.value=f2(tc);g_tv.inp.value=f2(tv);save(C,c);const tcol=toNum(p[fC].colhedora.tempo_colheita_min);const vv2=vv*2;g_vv2.inp.value=f2(vv2);g_tcolInfo.inp.value=f2(tcol);const ciclo=vv2+tcol+tc+tv;g_ciclo.inp.value=f2(ciclo);const capGv=toNum(c[capKey].GRUNNER);const tonHa=toNum(p[fC].colhedora.toneladas_por_ha);const pot=(ciclo>0&&tonHa>0&&capGv>0)?(60/ciclo)*(capGv/tonHa):0;potV.inp.value=f2(pot);if(typeof renderDashboard==='function'){try{renderDashboard()}catch(e){}}}recomputeTotal();recompute()}window.montarOperacaoNovaUI=function(){const tab=document.getElementById('tab-operacao');if(!tab)return;tab.innerHTML='';const grid=document.createElement('div');grid.className='params-grid';tab.appendChild(grid);montarPar(grid,{colheitaFr:'F39',plantioFr:'F34',raioKey:'r3439',capKey:'F39_34',velC:'F39C',velV:'F39V',titulo:'Par F34 ↔ F39'});montarPar(grid,{colheitaFr:'F41',plantioFr:'F36',raioKey:'r3641',capKey:'F41_36',velC:'F41C',velV:'F41V',titulo:'Par F36 ↔ F41'});['paramsWrap','capsWrap'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='none'});
+<script>(function(){const P='dashboard_parametros_v1',C='dashboard_cap_equip_v1',V='dashboard_vel_grunner_v1',R='dashboard_raio_v1';const toNum=v=>{const x=parseFloat(String(v).replace(',', '.'));return Number.isFinite(x)?x:0};const f2=v=>(Number(v)||0).toFixed(2);function load(k){try{return JSON.parse(localStorage.getItem(k)||'{}')}catch(e){return{}}}function save(k,o){const _v=JSON.stringify(o||{});_kvCache[k]=_v;localStorage.setItem(k,_v);kvSet(k,_v)}function ensure(){const p=load(P),c=load(C),v=load(V),r=load(R);['F34','F36','F39','F41'].forEach(fr=>{p[fr]=p[fr]||{};p[fr].plantadora=p[fr].plantadora||{tempo_plantio_min:'',abastecimento_muda_min:'',abastecimento_insumo_min:'',total_min:''};p[fr].colhedora=p[fr].colhedora||{tempo_colheita_min:'',capacidade_tt:'',toneladas_por_ha:'',toneladas_por_hora:''}});const vv=Object.assign({F39C:'',F39V:'',F41C:'',F41V:''},v||{});const rr=Object.assign({r3439:'',r3641:''},r||{});c['F39_34']=c['F39_34']||{PLANTADORA:'',GRUNNER:'',RODOMUDA:'',MULTICARGA:'',GRUNNER_TEMPO_CARREGADO_MIN:'',GRUNNER_TEMPO_VAZIO_MIN:''};c['F41_36']=c['F41_36']||{PLANTADORA:'',GRUNNER:'',RODOMUDA:'',MULTICARGA:'',GRUNNER_TEMPO_CARREGADO_MIN:'',GRUNNER_TEMPO_VAZIO_MIN:''};save(P,p);save(C,c);save(V,vv);save(R,rr);return{p,c,v:vv,r:rr}}function inputRow(label,value,oninput,opts={}){const row=document.createElement('div');row.className='param-row';row.style.display='grid';row.style.gridTemplateColumns='minmax(260px,1fr) 220px';row.style.gap='8px';const lab=document.createElement('div');lab.className='label';lab.textContent=label;const inp=document.createElement('input');inp.type=opts.type||'text';inp.inputMode='decimal';inp.value=(value!=null?String(value):'');if(opts.readonly){inp.readOnly=true;inp.tabIndex=-1;inp.style.background='#f8fafc'}['input','change','blur'].forEach(ev=>inp.addEventListener(ev,()=>oninput(inp.value)));row.appendChild(lab);row.appendChild(inp);return{row,inp}}const bloco=t=>{const b=document.createElement('div');b.className='param-block';const h=document.createElement('div');h.className='block-title';h.textContent=t;b.appendChild(h);return b};const card=t=>{const c=document.createElement('div');c.className='params-card';c.innerHTML='<h4>'+t+'</h4>';return c};function montarPar(container,cfg){const {p,c,v,r}=ensure();const fC=cfg.colheitaFr,fP=cfg.plantioFr,raioKey=cfg.raioKey,capKey=cfg.capKey,velC=cfg.velC,velV=cfg.velV;const wrap=card(cfg.titulo);const bColh=bloco('Colheita — '+fC);const r_tcol=inputRow('Tempo de colheita (min)',p[fC].colhedora.tempo_colheita_min,val=>{p[fC].colhedora.tempo_colheita_min=val;save(P,p);recompute()});const r_tt=inputRow('Capacidade T.T',p[fC].colhedora.capacidade_tt,val=>{p[fC].colhedora.capacidade_tt=val;save(P,p)});const r_tonha=inputRow('Toneladas por ha',p[fC].colhedora.toneladas_por_ha,val=>{p[fC].colhedora.toneladas_por_ha=val;save(P,p);recompute()});bColh.appendChild(r_tcol.row);bColh.appendChild(r_tt.row);bColh.appendChild(r_tonha.row);const bPlant=bloco('Plantio — '+fP);const p_tp=inputRow('Tempo de Plantio (min)',p[fP].plantadora.tempo_plantio_min,val=>{p[fP].plantadora.tempo_plantio_min=val;save(P,p);recomputeTotal()});const p_am=inputRow('Abastecimento de Muda (min)',p[fP].plantadora.abastecimento_muda_min,val=>{p[fP].plantadora.abastecimento_muda_min=val;save(P,p);recomputeTotal()});const p_ai=inputRow('Abastecimento de Insumo (min)',p[fP].plantadora.abastecimento_insumo_min,val=>{p[fP].plantadora.abastecimento_insumo_min=val;save(P,p);recomputeTotal()});const p_tot=inputRow('Total ciclo (min)',p[fP].plantadora.total_min,()=>{}, {readonly:true,type:'text'});function recomputeTotal(){const tot=toNum(p[fP].plantadora.tempo_plantio_min)+toNum(p[fP].plantadora.abastecimento_muda_min)+toNum(p[fP].plantadora.abastecimento_insumo_min);p[fP].plantadora.total_min=String(tot);p_tot.inp.value=f2(tot);save(P,p)}bPlant.appendChild(p_tp.row);bPlant.appendChild(p_am.row);bPlant.appendChild(p_ai.row);bPlant.appendChild(p_tot.row);const bGru=bloco('Grunner');const g_vc=inputRow('Velocidade Carregado (km/h)',v[velC],raw=>{v[velC]=String(raw).replace(',','.');save(V,v);recompute()});const g_vv=inputRow('Velocidade Vazio (km/h)',v[velV],raw=>{v[velV]=String(raw).replace(',','.');save(V,v);recompute()});const g_dst=inputRow('Distância (km)',r[raioKey],raw=>{r[raioKey]=String(raw).replace(',','.');save(R,r);recompute();window.Dim_refreshFromFrente&&window.Dim_refreshFromFrente()});const permKey='perm_'+raioKey;const g_perm=inputRow('Tempo Permanência no Dimensionamento (min)',r[permKey]||'',raw=>{r[permKey]=String(raw).replace(',','.');save(R,r);window.Dim_refreshFromFrente&&window.Dim_refreshFromFrente()});const g_tc=inputRow('Tempo Carregado (min)',c[capKey].GRUNNER_TEMPO_CARREGADO_MIN,()=>{}, {readonly:true,type:'text'});const g_tv=inputRow('Tempo Vazio (min)',c[capKey].GRUNNER_TEMPO_VAZIO_MIN,()=>{}, {readonly:true,type:'text'});const g_vv2=inputRow('Velocidade vazio x 2', '', ()=>{}, {readonly:true,type:'text'});const g_tcolInfo=inputRow('Tempo colheita '+fC+' (min)', '', ()=>{}, {readonly:true,type:'text'});const g_ciclo=inputRow('Ciclo (min) = (velocidade vazio*2) + Tempo colheita '+fC+' + Tempo Carregado + Tempo Vazio','',()=>{}, {readonly:true,type:'text'});bGru.appendChild(g_vc.row);bGru.appendChild(g_vv.row);bGru.appendChild(g_dst.row);bGru.appendChild(g_perm.row);bGru.appendChild(g_tc.row);bGru.appendChild(g_tv.row);bGru.appendChild(g_vv2.row);bGru.appendChild(g_tcolInfo.row);bGru.appendChild(g_ciclo.row);const bCap=bloco('Capacidade Equipamentos (T) — '+fP+'/'+fC);const capP=inputRow('Plantadora',c[capKey].PLANTADORA,val=>{c[capKey].PLANTADORA=val;save(C,c)});const capG=inputRow('Grunner',c[capKey].GRUNNER,val=>{c[capKey].GRUNNER=val;save(C,c);recompute()});bCap.appendChild(capP.row);bCap.appendChild(capG.row);const bPot=bloco('Potencial Grunner '+fC+' — Fórmula: 60 / Ciclo Grunner '+fC+' × Cap. Grunner ÷ Ton/ha '+fC);const potV=inputRow('Potencial = (60 / ciclo) * Cap. Grunner / Ton/ha '+fC,'',()=>{}, {readonly:true,type:'text'});bPot.appendChild(potV.row);wrap.appendChild(bColh);wrap.appendChild(bPlant);wrap.appendChild(bGru);wrap.appendChild(bCap);wrap.appendChild(bPot);container.appendChild(wrap);function recompute(){const dist=toNum(r[raioKey]);const vc=toNum(v[velC]);const vv=toNum(v[velV]);const tc=(dist>0&&vc>0)?(dist/vc)*60:0;const tv=(dist>0&&vv>0)?(dist/vv)*60:0;c[capKey].GRUNNER_TEMPO_CARREGADO_MIN=String(tc);c[capKey].GRUNNER_TEMPO_VAZIO_MIN=String(tv);g_tc.inp.value=f2(tc);g_tv.inp.value=f2(tv);save(C,c);const tcol=toNum(p[fC].colhedora.tempo_colheita_min);const vv2=vv*2;g_vv2.inp.value=f2(vv2);g_tcolInfo.inp.value=f2(tcol);const ciclo=vv2+tcol+tc+tv;g_ciclo.inp.value=f2(ciclo);const capGv=toNum(c[capKey].GRUNNER);const tonHa=toNum(p[fC].colhedora.toneladas_por_ha);const pot=(ciclo>0&&tonHa>0&&capGv>0)?(60/ciclo)*(capGv/tonHa):0;potV.inp.value=f2(pot);if(typeof renderDashboard==='function'){try{renderDashboard()}catch(e){}}}recomputeTotal();recompute()}window.montarOperacaoNovaUI=function(){const tab=document.getElementById('tab-operacao');if(!tab)return;tab.innerHTML='';const grid=document.createElement('div');grid.className='params-grid';tab.appendChild(grid);montarPar(grid,{colheitaFr:'F39',plantioFr:'F34',raioKey:'r3439',capKey:'F39_34',velC:'F39C',velV:'F39V',titulo:'Par F34 ↔ F39'});montarPar(grid,{colheitaFr:'F41',plantioFr:'F36',raioKey:'r3641',capKey:'F41_36',velC:'F41C',velV:'F41V',titulo:'Par F36 ↔ F41'});['paramsWrap','capsWrap'].forEach(id=>{const el=document.getElementById(id);if(el)el.style.display='none'});
 // Pares dinâmicos salvos pelo usuário (cada par tem plantFr + colhFr reais)
 var _paresDin=(typeof getParesDinamicos==='function'?getParesDinamicos():[]);
 if(_paresDin.length){
@@ -7886,10 +7980,7 @@ if(_paresDin.length){
     if(_ve[vV]===undefined) _ve[vV]='';
     if(_re[rk]===undefined) _re[rk]='';
   });
-  localStorage.setItem('dashboard_parametros_v1',JSON.stringify(_pe));
-  localStorage.setItem('dashboard_cap_equip_v1',JSON.stringify(_ce));
-  localStorage.setItem('dashboard_vel_grunner_v1',JSON.stringify(_ve));
-  localStorage.setItem('dashboard_raio_v1',JSON.stringify(_re));
+  [['dashboard_parametros_v1',_pe],['dashboard_cap_equip_v1',_ce],['dashboard_vel_grunner_v1',_ve],['dashboard_raio_v1',_re]].forEach(function(kv){const _v=JSON.stringify(kv[1]);_kvCache[kv[0]]=_v;localStorage.setItem(kv[0],_v);kvSet(kv[0],_v);});
   // Gera card completo (idêntico ao de F34↔F39 / F36↔F41) para cada par dinâmico
   _paresDin.forEach(function(par){
     montarPar(grid,{
@@ -7952,7 +8043,7 @@ window.Dim_refreshFromFrente = function() {
 (function(){window.addEventListener('load',function(){const btn=document.getElementById('btnConfig');if(!btn)return;btn.addEventListener('click',function(){const data=parseDataFromCSV();montarConfigKPIs&&montarConfigKPIs(data);montarOperacaoNovaUI&&montarOperacaoNovaUI();montarMetaDiaUI&&montarMetaDiaUI();montarConfigCharts&&montarConfigCharts(data); montarDashboardPCMeta && montarDashboardPCMeta();renderCuradoriaUI&&renderCuradoriaUI(data);montarConfigEquipamentos&&montarConfigEquipamentos();const d=document.getElementById('dashboardMain'),c=document.getElementById('configPage'),r=document.getElementById('realizadosPage');if(d&&c&&r){d.style.display='none';r.style.display='none';c.style.display='block'}const s=document.getElementById('salvarConfig');if(s)s.onclick=()=>salvarConfiguracoes(data)})})})();</script>
 
 
-<script>(function(){const KEY='dashboard_vel_grunner_v1';const safe=s=>{try{return JSON.parse(s||'{}')}catch(e){return{}}};const merge=(a,b)=>{const o={};Object.keys(a||{}).forEach(k=>o[k]=a[k]);Object.keys(b||{}).forEach(k=>o[k]=b[k]);return o};const getUI=()=>{const map={};try{const tab=document.getElementById('tab-operacao');if(!tab)return map;const cards=[...tab.querySelectorAll('.params-card')];const pick=(card,label)=>{const rows=[...card.querySelectorAll('.param-row')];const row=rows.find(r=>r.firstChild&&r.firstChild.textContent&&r.firstChild.textContent.trim().toLowerCase().startsWith(label));return row?row.querySelector('input')?.value:''};if(cards[0]){const vc=pick(cards[0],'velocidade carregado');const vv=pick(cards[0],'velocidade vazio');if(vc)map.F39C=String(vc).replace(',','.');if(vv)map.F39V=String(vv).replace(',','.')}if(cards[1]){const vc=pick(cards[1],'velocidade carregado');const vv=pick(cards[1],'velocidade vazio');if(vc)map.F41C=String(vc).replace(',','.');if(vv)map.F41V=String(vv).replace(',','.')}}catch(e){}return map};if(typeof window.salvarConfiguracoes==='function'){const old=window.salvarConfiguracoes;window.salvarConfiguracoes=function(data){const before=safe(localStorage.getItem(KEY));const ui=getUI();const ret=old.apply(this,arguments);const after=safe(localStorage.getItem(KEY));const merged=merge(after,merge(before,ui));localStorage.setItem(KEY,JSON.stringify(merged));return ret}}})();</script>
+<script>(function(){const KEY='dashboard_vel_grunner_v1';const safe=s=>{try{return JSON.parse(s||'{}')}catch(e){return{}}};const merge=(a,b)=>{const o={};Object.keys(a||{}).forEach(k=>o[k]=a[k]);Object.keys(b||{}).forEach(k=>o[k]=b[k]);return o};const getUI=()=>{const map={};try{const tab=document.getElementById('tab-operacao');if(!tab)return map;const cards=[...tab.querySelectorAll('.params-card')];const pick=(card,label)=>{const rows=[...card.querySelectorAll('.param-row')];const row=rows.find(r=>r.firstChild&&r.firstChild.textContent&&r.firstChild.textContent.trim().toLowerCase().startsWith(label));return row?row.querySelector('input')?.value:''};if(cards[0]){const vc=pick(cards[0],'velocidade carregado');const vv=pick(cards[0],'velocidade vazio');if(vc)map.F39C=String(vc).replace(',','.');if(vv)map.F39V=String(vv).replace(',','.')}if(cards[1]){const vc=pick(cards[1],'velocidade carregado');const vv=pick(cards[1],'velocidade vazio');if(vc)map.F41C=String(vc).replace(',','.');if(vv)map.F41V=String(vv).replace(',','.')}}catch(e){}return map};if(typeof window.salvarConfiguracoes==='function'){const old=window.salvarConfiguracoes;window.salvarConfiguracoes=function(data){const before=safe(localStorage.getItem(KEY));const ui=getUI();const ret=old.apply(this,arguments);const after=safe(localStorage.getItem(KEY));const merged=merge(after,merge(before,ui));const __vm=JSON.stringify(merged);_kvCache[KEY]=__vm;localStorage.setItem(KEY,__vm);kvSet(KEY,__vm);return ret}}})();</script>
 
 
 <!-- patch de potencial GRU legado removido: cálculo consolidado em renderChart -->
@@ -7963,7 +8054,7 @@ window.Dim_refreshFromFrente = function() {
   // === LS helpers (non-invasive) ===
   if(!window.LS_F38_KEY){ window.LS_F38_KEY='dashboard_f38_teorico_v1'; }
   if(!window.loadF38){ window.loadF38=function(){ try{ return JSON.parse(localStorage.getItem(window.LS_F38_KEY)) || {} }catch(e){ return {} } }; }
-  if(!window.saveF38){ window.saveF38=function(o){ localStorage.setItem(window.LS_F38_KEY, JSON.stringify(o||{})); }; }
+  if(!window.saveF38){ window.saveF38=function(o){ const _v=JSON.stringify(o||{});_kvCache[window.LS_F38_KEY]=_v;localStorage.setItem(window.LS_F38_KEY,_v);kvSet(window.LS_F38_KEY,_v); }; }
 
   // === Mount F38 card in Operação tab (additive) ===
   function mountF38Card(){
@@ -8027,7 +8118,7 @@ window.Dim_refreshFromFrente = function() {
     pc_getFrentes(op).forEach(function(f){
       if(!Array.isArray(map[hoje][f])) map[hoje][f]=new Array(24).fill('');
     });
-    localStorage.setItem(op==='preparo'?LS.PREP_DIA:LS.COMP_DIA, JSON.stringify(map));
+    const __vop=JSON.stringify(map);const __kop=op==='preparo'?LS.PREP_DIA:LS.COMP_DIA;_kvCache[__kop]=__vop;localStorage.setItem(__kop,__vop);kvSet(__kop,__vop);
   }
   function pc_somaDia(op,fr,d){ var arr=(((pc_loadDia(op)||{})[d]||{})[fr]||new Array(24).fill('')); var lim=(d===ymd(new Date()))? (new Date().getHours()):23; var s=0; for(var h=0;h<=lim;h++){ s+=pc_toNumber(arr[h]); } return s; }
   function pc_projDia(op,fr,d){ var arr=(((pc_loadDia(op)||{})[d]||{})[fr]||new Array(24).fill('')); var lim=(d===ymd(new Date()))? (new Date().getHours()):23; var s=0; for(var h=0;h<=lim;h++){ s+=pc_toNumber(arr[h]); } var rest=Math.max(0,24-(lim+1)); var md=(lim+1)>0? s/(lim+1):0; return s + md*rest; }
@@ -8247,7 +8338,7 @@ window.Dim_refreshFromFrente = function() {
 
     var LS_PC_STATUS = 'dashboard_pc_frota_status_v1';
     function pc_loadStatus() { try { return JSON.parse(localStorage.getItem(LS_PC_STATUS) || '{}'); } catch(e) { return {}; } }
-    function pc_saveStatus(o) { try { localStorage.setItem(LS_PC_STATUS, JSON.stringify(o || {})); } catch(e) {} }
+    function pc_saveStatus(o) { try { const _v=JSON.stringify(o||{});_kvCache[LS_PC_STATUS]=_v;localStorage.setItem(LS_PC_STATUS,_v);kvSet(LS_PC_STATUS,_v); } catch(e) {} }
 
     function pc_getItemStatus(fr, item) {
       var st = pc_loadStatus();
@@ -8279,7 +8370,7 @@ window.Dim_refreshFromFrente = function() {
         if (ant) ant.fim = now;
         log.push({ tipo: op, frente: fr, item: item, status: status, inicio: now, fim: null });
         if (typeof saveStatusLog === 'function') saveStatusLog(log);
-        else localStorage.setItem('dashboard_status_log_v1', JSON.stringify(log));
+        else {const _v=JSON.stringify(log);_kvCache['dashboard_status_log_v1']=_v;localStorage.setItem('dashboard_status_log_v1',_v);kvSet('dashboard_status_log_v1',_v);}
         // Reinicia horímetro
         if (typeof horimetroReset === 'function') horimetroReset(op, fr, item);
       } catch(e2) {}
@@ -8294,7 +8385,7 @@ window.Dim_refreshFromFrente = function() {
       eqGlobal[op][fr].mant = clean(eqGlobal[op][fr].mant);
       if (status === 'manutencao') eqGlobal[op][fr].mant.push(it);
       else eqGlobal[op][fr].prod.push(it);
-      try { localStorage.setItem('dashboard_equip_v1', JSON.stringify(eqGlobal)); } catch(e) {}
+      try { const _v=JSON.stringify(eqGlobal);_kvCache['dashboard_equip_v1']=_v;localStorage.setItem('dashboard_equip_v1',_v);kvSet('dashboard_equip_v1',_v); } catch(e) {}
     }
 
     function pc_getItems(fr) {
@@ -8907,7 +8998,7 @@ window.Dim_refreshFromFrente = function() {
     rowC.innerHTML='<label>Meta F32 (ha)</label><input type="number" step="any" min="0" id="meta_comp_f32" value="'+(mc.F32||'')+'">'+
                    '<label>Meta F33 (ha)</label><input type="number" step="any" min="0" id="meta_comp_f33" value="'+(mc.F33||'')+'">';
     wrap.appendChild(rowC); host.appendChild(wrap);
-    function saveG(){ var mpNew={}; try{mpNew=JSON.parse(localStorage.getItem(LS.PREP_META)||'{}');}catch(e){} mpNew.F18=document.getElementById('meta_prep_f18').value; mpNew.F28=document.getElementById('meta_prep_f28').value; localStorage.setItem(LS.PREP_META, JSON.stringify(mpNew)); var mcNew={}; try{mcNew=JSON.parse(localStorage.getItem(LS.COMP_META)||'{}');}catch(e){} mcNew.F32=document.getElementById('meta_comp_f32').value; mcNew.F33=document.getElementById('meta_comp_f33').value; localStorage.setItem(LS.COMP_META, JSON.stringify(mcNew)); if(typeof pc_render==='function'){ pc_render('preparo'); pc_render('composto'); } }
+    function saveG(){ var mpNew={}; try{mpNew=JSON.parse(localStorage.getItem(LS.PREP_META)||'{}');}catch(e){} mpNew.F18=document.getElementById('meta_prep_f18').value; mpNew.F28=document.getElementById('meta_prep_f28').value; const __vp=JSON.stringify(mpNew);_kvCache[LS.PREP_META]=__vp;localStorage.setItem(LS.PREP_META,__vp);kvSet(LS.PREP_META,__vp); var mcNew={}; try{mcNew=JSON.parse(localStorage.getItem(LS.COMP_META)||'{}');}catch(e){} mcNew.F32=document.getElementById('meta_comp_f32').value; mcNew.F33=document.getElementById('meta_comp_f33').value; const __vc=JSON.stringify(mcNew);_kvCache[LS.COMP_META]=__vc;localStorage.setItem(LS.COMP_META,__vc);kvSet(LS.COMP_META,__vc); if(typeof pc_render==='function'){ pc_render('preparo'); pc_render('composto'); } }
     ['meta_prep_f18','meta_prep_f28','meta_comp_f32','meta_comp_f33'].forEach(function(id){ var el=document.getElementById(id); if(el) el.addEventListener('input', saveG); });
 
     
@@ -8946,7 +9037,7 @@ window._montarPotenciaisPC = function(){
       var el=document.getElementById('pot_comp_'+sf);
       if(el){ obj[fr]=(el.value||'').replace(',','.'); }
     });
-    localStorage.setItem('dashboard_potencial_pc_v1',JSON.stringify(obj));
+    const __vq=JSON.stringify(obj);_kvCache['dashboard_potencial_pc_v1']=__vq;localStorage.setItem('dashboard_potencial_pc_v1',__vq);kvSet('dashboard_potencial_pc_v1',__vq);
     if(typeof pc_render==='function'){pc_render('preparo');pc_render('composto');}
   }
   window._savePotDyn=savePotDyn;
@@ -9000,14 +9091,14 @@ window._montarPotenciaisPC();
     if(pot>0){
       var irriCfg={}; try{irriCfg=JSON.parse(localStorage.getItem('dashboard_f38irri_v1')||'{}');}catch(e){}
       irriCfg.potencial_por_equip=pot;
-      localStorage.setItem('dashboard_f38irri_v1',JSON.stringify(irriCfg));
+      const __vi=JSON.stringify(irriCfg);_kvCache['dashboard_f38irri_v1']=__vi;localStorage.setItem('dashboard_f38irri_v1',__vi);kvSet('dashboard_f38irri_v1',__vi);
     }
   }catch(e){}
 })();
 }
 
 function buildEquip()
-{ var host=document.getElementById('tab-equipamentos'); if(!host) return; function block(label,frs,lsKey){ var wrap=document.createElement('div'); wrap.className='config-block'; wrap.style.margin='12px 0'; wrap.innerHTML='<h4>Equipamentos — '+label+'</h4>'; var map={}; try{map=JSON.parse(localStorage.getItem(lsKey)||'{}');}catch(e){} frs.forEach(function(fr){ map[fr]=map[fr]||{prod:[],mant:[]}; var row=document.createElement('div'); row.style.display='grid'; row.style.gridTemplateColumns='100px 1fr 1fr'; row.style.gap='8px'; row.style.margin='8px 0'; var lbl=document.createElement('div'); lbl.innerHTML='<strong>'+fr+'</strong>'; var c1=document.createElement('div'); c1.innerHTML='<div style="font-size:12px;color:#475569;margin-bottom:4px">Produtivos</div>'; var taP=document.createElement('textarea'); taP.rows=4; taP.placeholder='1 por linha'; taP.value=(map[fr].prod||[]).join('\n'); c1.appendChild(taP); var c2=document.createElement('div'); c2.innerHTML='<div style="font-size:12px;color:#475569;margin-bottom:4px">Manutenção</div>'; var taM=document.createElement('textarea'); taM.rows=4; taM.placeholder='1 por linha'; taM.value=(map[fr].mant||[]).join('\n'); c2.appendChild(taM); taP.addEventListener('input', function(){ map[fr].prod=taP.value.split('\n').map(function(s){return s.trim();}).filter(function(s){return !!s;}); localStorage.setItem(lsKey, JSON.stringify(map)); }); taM.addEventListener('input', function(){ map[fr].mant=taM.value.split('\n').map(function(s){return s.trim();}).filter(function(s){return !!s;}); localStorage.setItem(lsKey, JSON.stringify(map)); }); row.appendChild(lbl); row.appendChild(c1); row.appendChild(c2); wrap.appendChild(row); }); host.appendChild(wrap);} var _prepEqFrs=(function(){try{var a=JSON.parse(localStorage.getItem('dashboard_preparo_frentes_v1')||'[]');return(Array.isArray(a)&&a.length)?a:['F18','F28'];}catch(e){return['F18','F28'];}})();
+{ var host=document.getElementById('tab-equipamentos'); if(!host) return; function block(label,frs,lsKey){ var wrap=document.createElement('div'); wrap.className='config-block'; wrap.style.margin='12px 0'; wrap.innerHTML='<h4>Equipamentos — '+label+'</h4>'; var map={}; try{map=JSON.parse(localStorage.getItem(lsKey)||'{}');}catch(e){} frs.forEach(function(fr){ map[fr]=map[fr]||{prod:[],mant:[]}; var row=document.createElement('div'); row.style.display='grid'; row.style.gridTemplateColumns='100px 1fr 1fr'; row.style.gap='8px'; row.style.margin='8px 0'; var lbl=document.createElement('div'); lbl.innerHTML='<strong>'+fr+'</strong>'; var c1=document.createElement('div'); c1.innerHTML='<div style="font-size:12px;color:#475569;margin-bottom:4px">Produtivos</div>'; var taP=document.createElement('textarea'); taP.rows=4; taP.placeholder='1 por linha'; taP.value=(map[fr].prod||[]).join('\n'); c1.appendChild(taP); var c2=document.createElement('div'); c2.innerHTML='<div style="font-size:12px;color:#475569;margin-bottom:4px">Manutenção</div>'; var taM=document.createElement('textarea'); taM.rows=4; taM.placeholder='1 por linha'; taM.value=(map[fr].mant||[]).join('\n'); c2.appendChild(taM); taP.addEventListener('input', function(){ map[fr].prod=taP.value.split('\n').map(function(s){return s.trim();}).filter(function(s){return !!s;}); const __vm2=JSON.stringify(map);_kvCache[lsKey]=__vm2;localStorage.setItem(lsKey,__vm2);kvSet(lsKey,__vm2); }); taM.addEventListener('input', function(){ map[fr].mant=taM.value.split('\n').map(function(s){return s.trim();}).filter(function(s){return !!s;}); localStorage.setItem(lsKey, JSON.stringify(map)); }); row.appendChild(lbl); row.appendChild(c1); row.appendChild(c2); wrap.appendChild(row); }); host.appendChild(wrap);} var _prepEqFrs=(function(){try{var a=JSON.parse(localStorage.getItem('dashboard_preparo_frentes_v1')||'[]');return(Array.isArray(a)&&a.length)?a:['F18','F28'];}catch(e){return['F18','F28'];}})();
 var _compEqFrs=(function(){try{var a=JSON.parse(localStorage.getItem('dashboard_composto_frentes_v1')||'[]');return(Array.isArray(a)&&a.length)?a:['F32','F33'];}catch(e){return['F32','F33'];}})();
 block('PREPARO', _prepEqFrs, LS.PREP_EQ); block('COMPOSTO', _compEqFrs, LS.COMP_EQ); }
 
@@ -9191,7 +9282,7 @@ function getConfigGlobal(){
 function setConfigGlobal(novosDados){
     const atual = getConfigGlobal();
     const atualizado = {...atual, ...novosDados};
-    localStorage.setItem(CONFIG_KEY, JSON.stringify(atualizado));
+    const __vck=JSON.stringify(atualizado);_kvCache[CONFIG_KEY]=__vck;localStorage.setItem(CONFIG_KEY,__vck);kvSet(CONFIG_KEY,__vck);
 }
 
 function salvarConfiguracoesDistancia(){
@@ -9415,7 +9506,7 @@ document.addEventListener("DOMContentLoaded", carregarConfiguracoes);
   function loadPC(){
     try{ var r=localStorage.getItem(LS_PC); return r?JSON.parse(r):defaultData(); }catch(e){ return defaultData(); }
   }
-  function savePC(d){ localStorage.setItem(LS_PC, JSON.stringify(d)); }
+  function savePC(d){ const _v=JSON.stringify(d);_kvCache[LS_PC]=_v;localStorage.setItem(LS_PC,_v);kvSet(LS_PC,_v); }
 
   function getFrentes(key){ try{ var a=JSON.parse(localStorage.getItem(key)||'[]'); return Array.isArray(a)&&a.length?a:[]; }catch(e){ return []; } }
 
@@ -9753,7 +9844,7 @@ document.addEventListener("DOMContentLoaded", carregarConfiguracoes);
       try{
         var _irriCfg={}; try{_irriCfg=JSON.parse(localStorage.getItem('dashboard_f38irri_v1')||'{}');}catch(e){}
         _irriCfg.potencial_por_equip=d.irrigacao.potencial_ha_h;
-        localStorage.setItem('dashboard_f38irri_v1',JSON.stringify(_irriCfg));
+        const __vii=JSON.stringify(_irriCfg);_kvCache['dashboard_f38irri_v1']=__vii;localStorage.setItem('dashboard_f38irri_v1',__vii);kvSet('dashboard_f38irri_v1',__vii);
         if(typeof renderDashboard==='function') try{renderDashboard();}catch(e){}
         if(typeof pc_render==='function') try{pc_render('preparo');}catch(e){}
       }catch(e){}
@@ -10782,7 +10873,7 @@ tsEl.textContent = `Atualizado às ${hora} horário de Cuiabá`;
     var url = inp.value.trim();
     if (!url) { alert('Cole a URL do Webhook do Power Automate no campo acima.'); return; }
     if (!url.startsWith('http')) { alert('URL inválida. Deve começar com https://'); return; }
-    try { localStorage.setItem(LS_WEBHOOK_KEY, url); } catch(e) {}
+    try { localStorage.setItem(LS_WEBHOOK_KEY, url); kvSet(LS_WEBHOOK_KEY, url); } catch(e) {}
     atualizarStatusUI();
     alert('✅ URL salva com sucesso!\n\nUse o botão "Testar" para verificar a conexão.');
   };
@@ -10790,7 +10881,7 @@ tsEl.textContent = `Atualizado às ${hora} horário de Cuiabá`;
   // ── Limpar URL ──
   window.teamsWebhookLimpar = function() {
     if (!confirm('Remover a URL do Webhook configurada?')) return;
-    try { localStorage.removeItem(LS_WEBHOOK_KEY); } catch(e) {}
+    try { localStorage.removeItem(LS_WEBHOOK_KEY); kvRemove(LS_WEBHOOK_KEY); } catch(e) {}
     var inp = document.getElementById('teamsWebhookInput');
     if (inp) inp.value = '';
     atualizarStatusUI();
