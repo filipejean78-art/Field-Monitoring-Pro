@@ -3924,13 +3924,23 @@ function getPotencialFrente(chartId, fr){
       }).length;
     };
 
+    // Helper: calcula tph a partir de toneladas_por_ha ou toneladas_por_hora
+    const getTph = (colhFr) => {
+      const cp = params?.[colhFr]?.colhedora||{};
+      const tphDirect = n(cp.toneladas_por_hora);
+      if(tphDirect>0) return tphDirect;
+      // Fallback: usa toneladas_por_ha (campo salvo pela nova UI)
+      return n(cp.toneladas_por_ha);
+    };
+
     // --- Plantadoras F34, F36 ---
     if(chartId==='plantadora' && (fr==='F34'||fr==='F36')){
+      const colhFr = fr==='F34' ? 'F39' : 'F41';
       const capKey = fr==='F34' ? 'F39_34' : 'F41_36';
-      const p = params?.[fr]?.plantadora||{};
-      const tot = n(p.total_min) || (n(p.tempo_plantio_min)+n(p.abastecimento_muda_min)+n(p.abastecimento_insumo_min));
+      const p    = params?.[fr]?.plantadora||{};
+      const tot  = n(p.total_min) || (n(p.tempo_plantio_min)+n(p.abastecimento_muda_min)+n(p.abastecimento_insumo_min));
       const capP = n(caps?.[capKey]?.PLANTADORA) || 5.6;
-      const tph  = n(params?.[fr]?.colhedora?.toneladas_por_hora);
+      const tph  = getTph(colhFr);
       const qtd  = qtdSoProdutiva('plantadora', fr);
       if(tot>0 && tph>0) return (60/tot)*capP/tph*qtd*0.9;
       return 0;
@@ -3943,29 +3953,36 @@ function getPotencialFrente(chartId, fr){
       const qtd = qtdSoProdutiva('plantadora','F38');
       return potF38*qtd;
     }
-    // --- Colhedoras F39, F41 ---
+    // --- Colhedoras (qualquer frente) ---
     if(chartId==='colhedora'){
-      const capKey = fr==='F39' ? 'F39_34' : 'F41_36';
-      const tphFr  = fr==='F39' ? n(params?.F34?.colhedora?.toneladas_por_hora) : n(params?.F36?.colhedora?.toneladas_por_hora);
-      const tcol   = n(params?.[fr]?.colhedora?.tempo_colheita_min);
-      const capG   = n(caps?.[capKey]?.GRUNNER);
-      const qtd    = qtdSoProdutiva('colhedora', fr);
-      if(tcol>0 && tphFr>0 && capG>0) return ((60/tcol)*(capG/tphFr))*qtd*0.9;
+      // Descobre a frente de plantio associada pela posição no CHART_EQUIP_MAP
+      const plantFrs = (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.plantadora) || ['F34','F36'];
+      const colhFrs  = (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.colhedora)  || ['F39','F41'];
+      const idx = colhFrs.indexOf(fr);
+      const plantFr = idx>=0 ? (plantFrs[idx]||plantFrs[0]) : plantFrs[0];
+      const capKey = idx===0 ? 'F39_34' : (idx===1 ? 'F41_36' : 'F39_34');
+      const tph  = getTph(fr);
+      const tcol = n(params?.[fr]?.colhedora?.tempo_colheita_min);
+      const capG = n(caps?.[capKey]?.GRUNNER);
+      const qtd  = qtdSoProdutiva('colhedora', fr);
+      if(tcol>0 && tph>0 && capG>0) return ((60/tcol)*(capG/tph))*qtd*0.9;
       return 0;
     }
-    // --- Grunner F39, F41 ---
+    // --- Grunner (qualquer frente) ---
     if(chartId==='grunner_pm'){
-      const capKey  = fr==='F39' ? 'F39_34' : 'F41_36';
-      const plantFr = fr==='F39' ? 'F34' : 'F36';
-      const carg    = n(params?.[plantFr]?.transporte?.Grunner?.carregamento_min);
-      const perm    = fr==='F41' ? n(params?.[plantFr]?.transporte?.Grunner?.permanencia_campo_min) : 0;
-      const tc      = n(caps?.[capKey]?.GRUNNER_TEMPO_CARREGADO_MIN);
-      const tv      = n(caps?.[capKey]?.GRUNNER_TEMPO_VAZIO_MIN);
-      const capG    = n(caps?.[capKey]?.GRUNNER);
-      const tcol    = n(params?.[fr]?.colhedora?.tempo_colheita_min);
-      const tonHa   = fr==='F39' ? tcol : n(params?.[plantFr]?.colhedora?.capacidade_tt);
-      const ciclo   = fr==='F39' ? (carg*2)+tc+tv : (carg+perm+tc+tv);
-      const qtd     = qtdSoProdutiva('grunner_pm', fr);
+      const colhFrs = (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.colhedora) || ['F39','F41'];
+      const plantFrs= (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.plantadora)|| ['F34','F36'];
+      const idx = colhFrs.indexOf(fr);
+      const plantFr = idx>=0 ? (plantFrs[idx]||plantFrs[0]) : plantFrs[0];
+      const capKey  = idx===0 ? 'F39_34' : (idx===1 ? 'F41_36' : 'F39_34');
+      const tc    = n(caps?.[capKey]?.GRUNNER_TEMPO_CARREGADO_MIN);
+      const tv    = n(caps?.[capKey]?.GRUNNER_TEMPO_VAZIO_MIN);
+      const capG  = n(caps?.[capKey]?.GRUNNER);
+      const tcol  = n(params?.[fr]?.colhedora?.tempo_colheita_min);
+      const tonHa = getTph(fr) || n(params?.[plantFr]?.colhedora?.toneladas_por_ha);
+      // ciclo: carregamento(3min)*2 + tempo colheita + carregado + vazio
+      const ciclo = (3*2) + tcol + tc + tv;
+      const qtd   = qtdSoProdutiva('grunner_pm', fr);
       if(ciclo>0 && tonHa>0 && capG>0) return ((60/ciclo)*(capG/tonHa))*qtd*0.9;
       return 0;
     }
@@ -5182,6 +5199,14 @@ function montarConfigEquipamentos(){
       if([LS_PLANT_FR,LS_COLH_FR,LS_GRUN_FR].indexOf(lsKey)!==-1&&typeof renderDashboard==='function') renderDashboard();
       if(lsKey===LS_PREP_FR&&typeof pc_render==='function') pc_render('preparo');
       if(lsKey===LS_COMP_FR&&typeof pc_render==='function') pc_render('composto');
+      // Atualiza sub-aba Parâmetros para incluir as novas frentes
+      if([LS_PLANT_FR,LS_COLH_FR,LS_GRUN_FR].indexOf(lsKey)!==-1){
+        if(typeof montarParametrosUI==='function') try{ montarParametrosUI(); }catch(e){}
+        if(typeof montarCapacidadesEquipUI==='function') try{ montarCapacidadesEquipUI(); }catch(e){}
+        if(typeof montarFrentesEParesUI==='function') try{ montarFrentesEParesUI(); }catch(e){}
+        // Re-monta UI de Operação (nova UI que lê frentes dinâmicas)
+        if(typeof montarOperacaoNovaUI==='function') try{ montarOperacaoNovaUI(); }catch(e){}
+      }
     }catch(e){}
   }
 
@@ -6010,7 +6035,7 @@ if (typeof Chart !== "undefined") {
   // Hook on Config open
   window.addEventListener('load', function(){
     var btn = document.getElementById('btnConfig');
-    if(btn){ btn.addEventListener('click', function(){ setTimeout(mountF38Card, 50); setTimeout(mountF38IRRICard, 100); }); }
+    if(btn){ btn.addEventListener('click', function(){ setTimeout(mountF38Card, 50); setTimeout(mountF38IRRICard, 120); }); }
   });
 
 })();
@@ -6046,7 +6071,8 @@ if (typeof Chart !== "undefined") {
   }
 
   window.mountF38IRRICard = function(){
-    var tab=document.getElementById('tab-operacao'); if(!tab) return;
+    // Usa tab-parametros (mesmo destino do mountF38Card), NÃO tab-operacao
+    var tab=document.getElementById('tab-parametros')||document.getElementById('tab-operacao'); if(!tab) return;
     var grid=tab.querySelector('.params-grid');
     if(!grid){ grid=document.createElement('div'); grid.className='params-grid'; tab.appendChild(grid); }
     if(grid.querySelector("[data-card='f38irri']")) return;
