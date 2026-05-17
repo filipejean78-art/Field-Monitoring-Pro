@@ -3904,6 +3904,7 @@ function getPotencialFrente(chartId, fr){
     const equip  = (function(){ try{return JSON.parse(localStorage.getItem('dashboard_equip_v1')||'{}')}catch(e){return{}} })();
     const frotaSt= (function(){ try{return JSON.parse(localStorage.getItem('dashboard_frota_status_v1')||'{}')}catch(e){return{}} })();
     const n = v => { const x=parseFloat(String(v||'').replace(',','.')); return isFinite(x)?x:0; };
+    const _dbg = (label, val) => { if(window._dbgPot) console.log('[POT '+chartId+'/'+fr+']', label, val); return val; };
 
     // Conta APENAS equipamentos com status 'produtiva'
     const qtdSoProdutiva = (tipo, f) => {
@@ -3955,40 +3956,63 @@ function getPotencialFrente(chartId, fr){
     }
     // --- Colhedoras (qualquer frente) ---
     if(chartId==='colhedora'){
-      // Descobre a frente de plantio associada pela posição no CHART_EQUIP_MAP
-      const plantFrs = (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.plantadora) || ['F34','F36'];
       const colhFrs  = (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.colhedora)  || ['F39','F41'];
-      const idx = colhFrs.indexOf(fr);
+      const plantFrs = (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.plantadora) || ['F34','F36'];
+      const idx    = colhFrs.indexOf(fr);
+      // capKey: usa o par plantadora-colhedora salvo em caps
+      // Tenta o par canônico primeiro, depois fallback por posição
       const plantFr = idx>=0 ? (plantFrs[idx]||plantFrs[0]) : plantFrs[0];
-      const capKey = idx===0 ? 'F39_34' : (idx===1 ? 'F41_36' : 'F39_34');
+      // Descobre capKey: busca em caps qual tem a chave que relaciona plantFr+fr
+      const capKey = (function(){
+        const kMap = { 'F34_F39':'F39_34','F36_F41':'F41_36','F39_34':'F39_34','F41_36':'F41_36' };
+        const try1 = plantFr.replace('F','') + '_' + fr.replace('F',''); // ex: 34_39
+        const try2 = fr.replace('F','') + '_' + plantFr.replace('F',''); // ex: 39_34
+        if(caps['F'+try2]) return 'F'+try2;
+        if(caps['F'+try1]) return 'F'+try1;
+        // fallback por índice
+        return idx===0 ? 'F39_34' : 'F41_36';
+      })();
       const tph  = getTph(fr);
       const tcol = n(params?.[fr]?.colhedora?.tempo_colheita_min);
       const capG = n(caps?.[capKey]?.GRUNNER);
       const qtd  = qtdSoProdutiva('colhedora', fr);
+      _dbg('colh tcol='+tcol+' tph='+tph+' capG='+capG+' capKey='+capKey+' qtd='+qtd, '');
       if(tcol>0 && tph>0 && capG>0) return ((60/tcol)*(capG/tph))*qtd*0.9;
+      // Se não tem parâmetros configurados mas tem equipamentos: retorna 0 explícito
       return 0;
     }
     // --- Grunner (qualquer frente) ---
     if(chartId==='grunner_pm'){
-      const colhFrs = (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.colhedora) || ['F39','F41'];
-      const plantFrs= (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.plantadora)|| ['F34','F36'];
-      const idx = colhFrs.indexOf(fr);
+      const colhFrs  = (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.colhedora)  || ['F39','F41'];
+      const plantFrs = (typeof CHART_EQUIP_MAP!=='undefined' && CHART_EQUIP_MAP.plantadora) || ['F34','F36'];
+      const idx     = colhFrs.indexOf(fr);
       const plantFr = idx>=0 ? (plantFrs[idx]||plantFrs[0]) : plantFrs[0];
-      const capKey  = idx===0 ? 'F39_34' : (idx===1 ? 'F41_36' : 'F39_34');
+      const capKey  = (function(){
+        const try2 = fr.replace('F','') + '_' + plantFr.replace('F','');
+        if(caps['F'+try2]) return 'F'+try2;
+        return idx===0 ? 'F39_34' : 'F41_36';
+      })();
       const tc    = n(caps?.[capKey]?.GRUNNER_TEMPO_CARREGADO_MIN);
       const tv    = n(caps?.[capKey]?.GRUNNER_TEMPO_VAZIO_MIN);
       const capG  = n(caps?.[capKey]?.GRUNNER);
       const tcol  = n(params?.[fr]?.colhedora?.tempo_colheita_min);
-      const tonHa = getTph(fr) || n(params?.[plantFr]?.colhedora?.toneladas_por_ha);
-      // ciclo: carregamento(3min)*2 + tempo colheita + carregado + vazio
-      const ciclo = (3*2) + tcol + tc + tv;
+      // tonHa: tenta colhedora do fr, depois plantFr
+      const tonHa = getTph(fr) || n(params?.[plantFr]?.colhedora?.toneladas_por_ha) || n(params?.[fr]?.colhedora?.toneladas_por_ha);
+      const carg  = 3; // fixo 3 min
+      const ciclo = (carg*2) + tcol + tc + tv;
       const qtd   = qtdSoProdutiva('grunner_pm', fr);
+      _dbg('grun ciclo='+ciclo+' tonHa='+tonHa+' capG='+capG+' capKey='+capKey+' tc='+tc+' tv='+tv+' tcol='+tcol+' qtd='+qtd, '');
       if(ciclo>0 && tonHa>0 && capG>0) return ((60/ciclo)*(capG/tonHa))*qtd*0.9;
       return 0;
     }
   }catch(e){}
   return null;
 }
+
+// Debug helper: no console do browser, execute: window._dbgPot=true; renderDashboard()
+// Depois: window._dbgPot=false;
+// Para testar: getPotencialFrente('colhedora','F41')
+window._dbgPot = false;
 
 function renderFleetCard(chartId){
   const equip = (typeof loadEquip==='function'? (loadEquip()||{}) : {});
@@ -4411,140 +4435,81 @@ if (chart === 'preparo' || chart === 'composto') {
 
   /* === Potenciais: cálculos dinâmicos === */
   if(chart==='Potencial'){
-    const params = (function(){ try{return JSON.parse(localStorage.getItem(LS_PARAMS_KEY)||'{}')}catch(e){return {}} })();
-    const caps   = (function(){ try{return JSON.parse(localStorage.getItem(LS_CAP_KEY)||'{}')}catch(e){return {}} })();
-    const equip  = (function(){ try{return JSON.parse(localStorage.getItem(LS_EQUIP_KEY)||'{}')}catch(e){return {}} })();
+    // ── Usa exatamente a mesma função dos cards (getPotencialFrente) ──
+    // Garante que gráfico e cards sempre mostrem o mesmo valor.
+    const _plantFrs = CHART_EQUIP_MAP.plantadora || ['F34','F36','F38'];
+    const _colhFrs  = CHART_EQUIP_MAP.colhedora  || ['F39','F41'];
+    const _grunFrs  = CHART_EQUIP_MAP.grunner_pm || ['F39','F41'];
 
-    function totalMin(fr){
-      const p=params?.[fr]?.plantadora||{};
-      const t=numAny(p.total_min);
-      if(t!=null) return t;
-      const a=numAny(p.tempo_plantio_min)||0, b=numAny(p.abastecimento_muda_min)||0, c=numAny(p.abastecimento_insumo_min)||0;
-      return a+b+c;
-    }
-    const tonHora = fr => numAny(params?.[fr]?.colhedora?.toneladas_por_hora) || 0;
-    const tempoColheita = fr => numAny(params?.[fr]?.colhedora?.tempo_colheita_min) || 0;
+    // Cores por categoria
+    const _corMap = {
+      plantadora : '#f59e0b',
+      colhedora  : '#60a5fa',
+      grunner_pm : '#8b5cf6',
+      F38        : '#94a3b8',
+      F38IRRI    : '#06b6d4',
+      GRU_39_34  : '#8b5cf6',
+      GRU_41_36  : '#8b5cf6',
+    };
 
-    function capPlant(fr){
-      if(fr==='F34'){ return numAny(caps?.F39_34?.PLANTADORA) || 5.6; }
-      if(fr==='F36'){ return numAny(caps?.F41_36?.PLANTADORA) || 5.6; }
-      return 5.6;
-    }
-    function capGrunner(pair){
-      if(pair==='F39_34') return numAny(caps?.F39_34?.GRUNNER) || 0;
-      if(pair==='F41_36') return numAny(caps?.F41_36?.GRUNNER) || 0;
-      return 0;
+    function _pushPot(categoria, valor, cor){
+      rowsForPlot = rowsForPlot.filter(r => !(r.chart==='Potencial' && r.categoria===categoria && r.serie==='Pot'));
+      rowsForPlot.push({tipo:'SERIE', valor:String(valor||0), cor:cor||'#22c55e',
+                        chart:'Potencial', categoria, serie:'Pot', secao:'Operação'});
     }
 
-    const qtdPlantadoras = fr => Array.isArray(equip?.plantadora?.[fr]?.prod) ? equip.plantadora[fr].prod.length : 0;
-    const qtdColhedoras  = fr => Array.isArray(equip?.colhedora?.[fr]?.prod)  ? equip.colhedora[fr].prod.length  : 0;
-
-    // F34 & F36: × Plantadoras Produtivas × 0,9
-    ['F34','F36'].forEach(fr=>{
-      const tot=totalMin(fr), cap=capPlant(fr), tph=tonHora(fr), qtdP=qtdPlantadoras(fr);
-      let valor=0; if(tot>0 && tph>0 && qtdP>0) valor=(60/tot)*cap/tph*qtdP*0.9;
-      let r=rowsForPlot.find(x=>x.categoria===fr && x.serie==='Pot');
-      if(!r){ r={tipo:'SERIE',valor:'0',cor:'#22c55e',chart:'Potencial',categoria:fr,serie:'Pot',secao:'Operação'}; rowsForPlot.push(r); }
-      r.valor=String(valor);
+    // Plantadoras
+    _plantFrs.forEach(fr => {
+      if(fr==='F38'){
+        // F38 usa loadF38
+        var cfgF38={}; try{cfgF38=(typeof loadF38==='function'?loadF38():{});}catch(e){}
+        const vel=parseFloat(String(cfgF38.velocidade||'').replace(',','.'))||0;
+        const potUnit = vel>0 ? ((3*vel)/0.37)/100 : 0;
+        const v = getPotencialFrente('plantadora','F38') || 0;
+        _pushPot('F38', v, '#94a3b8');
+      } else {
+        const v = getPotencialFrente('plantadora', fr) || 0;
+        _pushPot(fr, v, '#f59e0b');
+      }
     });
 
-    // F39: NOVA FÓRMULA — (60 / Tempo Colheita F39) * Cap(ton) Grunner / TPH F34 * Qtd COLHEDORAS Prod F39 * 0,9
-{
- const tcolF39 = numAny(params?.['F39']?.colhedora?.tempo_colheita_min) || 0;
- const tphF34  = tonHora('F34');
- const capG    = capGrunner('F39_34');
- const qtdC    = qtdColhedoras('F39');
- let v = 0;
- if (tcolF39>0 && tphF34>0 && capG>0 && qtdC>0){
-   v = ((60/tcolF39) * (capG/tphF34)) * qtdC * 0.9;
- }
- let r=rowsForPlot.find(x=>x.categoria==='F39' && x.serie==='Pot');
- if(!r){ r={tipo:'SERIE',valor:'0',cor:'#22c55e',chart:'Potencial',categoria:'F39',serie:'Pot',secao:'Operação'}; rowsForPlot.push(r); }
- r.valor=String(v);
-}
-// F41: NOVA FÓRMULA — (60 / Tempo Colheita F41) * Cap(ton) Grunner / TPH F36 * Qtd COLHEDORAS Prod F41 * 0,9
-{
- const tcolF41 = numAny(params?.['F41']?.colhedora?.tempo_colheita_min) || 0;
- const tphF36  = tonHora('F36');
- const capG    = capGrunner('F41_36');
- const qtdC    = qtdColhedoras('F41');
- let v = 0;
- if (tcolF41>0 && tphF36>0 && capG>0 && qtdC>0){
-   v = ((60/tcolF41) * (capG/tphF36)) * qtdC * 0.9;
- }
- let r=rowsForPlot.find(x=>x.categoria==='F41' && x.serie==='Pot');
- if(!r){ r={tipo:'SERIE',valor:'0',cor:'#22c55e',chart:'Potencial',categoria:'F41',serie:'Pot',secao:'Operação'}; rowsForPlot.push(r); }
- r.valor=String(v);
-}
-// === BARRAS 'Gru' por par (F34/F39 e F36/F41) — AJUSTE F36/F41 conforme solicitado ===
-{
- const c=caps, p=params, eq=equip;
- // Entradas comuns
- const cargF34 = numAny(p?.['F34']?.transporte?.Grunner?.carregamento_min) || 0;
- const cargF36 = numAny(p?.['F36']?.transporte?.Grunner?.carregamento_min) || 0;
- const permF36 = numAny(p?.['F36']?.transporte?.Grunner?.permanencia_campo_min) || 0;
- const tc_39_34 = numAny(c?.['F39_34']?.['GRUNNER_TEMPO_CARREGADO_MIN']) || 0;
- const tv_39_34 = numAny(c?.['F39_34']?.['GRUNNER_TEMPO_VAZIO_MIN']) || 0;
- const tc_41_36 = numAny(c?.['F41_36']?.['GRUNNER_TEMPO_CARREGADO_MIN']) || 0;
- const tv_41_36 = numAny(c?.['F41_36']?.['GRUNNER_TEMPO_VAZIO_MIN']) || 0;
- const capG_39_34 = numAny(c?.['F39_34']?.GRUNNER) || 0;
- const capG_41_36 = numAny(c?.['F41_36']?.GRUNNER) || 0;
- const tonHaF36 = numAny(p?.['F36']?.colhedora?.capacidade_tt) || 0; // Toneladas por ha F36
- const tphF34 = numAny(p?.['F34']?.colhedora?.toneladas_por_hora) || 0; // segue igual para o par 39/34
- const tcol39 = numAny(p?.['F39']?.colhedora?.tempo_colheita_min) || 0; // permanece para 39/34
- const qtdG39 = Array.isArray(eq?.grunner_pm?.F39?.prod) ? eq.grunner_pm.F39.prod.length : 0;
- const qtdG41 = Array.isArray(eq?.grunner_pm?.F41?.prod) ? eq.grunner_pm.F41.prod.length : 0;
+    // Colhedoras
+    _colhFrs.forEach(fr => {
+      const v = getPotencialFrente('colhedora', fr) || 0;
+      _pushPot(fr, v, '#60a5fa');
+    });
 
- // 1ª etapa (ciclos)
- const ciclo_39_34 = (cargF34*2) + tc_39_34 + tv_39_34;
- const ciclo_41_36 = (cargF36 + permF36 + tc_41_36 + tv_41_36); // AJUSTE: carrega + permanência + carregado + vazio
+    // Grunner — cada frente vira GRU_<colh>_<plant> para o gráfico
+    _grunFrs.forEach((fr, idx) => {
+      const v = getPotencialFrente('grunner_pm', fr) || 0;
+      // Mantém as categorias canônicas GRU_39_34 / GRU_41_36 para o gráfico existente
+      // Para frentes adicionais usa GRU_<fr>
+      let cat;
+      if(fr==='F39') cat='GRU_39_34';
+      else if(fr==='F41') cat='GRU_41_36';
+      else cat='GRU_'+fr;
+      _pushPot(cat, v, '#8b5cf6');
+    });
 
- // 2ª etapa
- const base_39_34 = (ciclo_39_34>0 && tcol39>0) ? (60/ciclo_39_34)*(capG_39_34/tcol39) : 0; // mantém como V2.8
- const base_41_36 = (ciclo_41_36>0 && tonHaF36>0) ? (60/ciclo_41_36)*(capG_41_36/tonHaF36) : 0; // AJUSTE: divide por Ton/ha F36
-
- // 3ª etapa (× grunner produtivos × 0,9)
- const vGru_39_34 = base_39_34 * qtdG39 * 0.9;
- const vGru_41_36 = base_41_36 * qtdG41 * 0.9;
-
- rowsForPlot.push({tipo:'SERIE',valor:String(vGru_39_34),cor:'#8b5cf6',chart:'Potencial',categoria:'GRU_39_34',serie:'Pot',secao:'Operação'});
- rowsForPlot.push({tipo:'SERIE',valor:String(vGru_41_36),cor:'#8b5cf6',chart:'Potencial',categoria:'GRU_41_36',serie:'Pot',secao:'Operação'});
-}
-// F38 dinâmico: Potencial (card) × qtd Plantadoras Prod F38
-{
- var cfgF38={}; try{ cfgF38=(typeof loadF38==='function'?loadF38():{});}catch(e){}
- var vel=parseFloat(String(cfgF38.velocidade||'').replace(',','.'))||0;
- var potF38 = vel>0 ? ((3*vel)/0.37)/100 : 0;
- var __equipF38={}; try{ __equipF38=loadEquip(); }catch(e){}
- var qty=(__equipF38 && __equipF38.plantadora && __equipF38.plantadora.F38 && Array.isArray(__equipF38.plantadora.F38.prod))?__equipF38.plantadora.F38.prod.length:0;
- var vF38=potF38*qty;
- rowsForPlot = rowsForPlot.filter(function(r){return !(r.chart==='Potencial' && r.categoria==='F38' && r.serie==='Pot');});
- rowsForPlot.push({tipo:'SERIE',valor:String(vF38),cor:'#94a3b8',chart:'Potencial',categoria:'F38',serie:'Pot',secao:'Operação'});
- // F38IRRI: potencial_por_equip × qtd produtivos
- (function(){
-   var _cfg={}; try{_cfg=JSON.parse(localStorage.getItem('dashboard_f38irri_v1')||'{}');}catch(e){}
-   var potUnit=parseFloat(String(_cfg.potencial_por_equip||'').replace(',','.'))||0;
-   // Lê equipamentos de dashboard_equip_v1 → plantadora.F38IRRI
-   var _eqGlobal={}; try{_eqGlobal=JSON.parse(localStorage.getItem('dashboard_equip_v1')||'{}');}catch(e){}
-   var _st={};  try{_st =JSON.parse(localStorage.getItem('dashboard_frota_status_v1')||'{}');}catch(e){}
-   var _peIRRI=(_eqGlobal.plantadora&&_eqGlobal.plantadora.F38IRRI)||{};
-   var _prod=Array.isArray(_peIRRI.prod)?_peIRRI.prod:[];
-   var _mant=Array.isArray(_peIRRI.mant)?_peIRRI.mant:[];
-   var _all=[]; _prod.concat(_mant).forEach(function(x){var s=String(x).trim();if(s&&_all.indexOf(s)===-1)_all.push(s);});
-   var _stF38IRRI=(_st.plantadora&&_st.plantadora.F38IRRI)||{};
-   var qtdIRRI=_all.filter(function(it){
-     var norm=String(_stF38IRRI[it]||'').toLowerCase();
-     if(norm==='produtiva'||norm==='prod'||norm==='produtivo') return true;
-     if(norm==='operacional'||norm==='op') return true;  // operacional conta como produtivo
-     if(norm==='manutencao'||norm==='manutenção'||norm==='mant') return false;
-     // sem status: conta se não está em mant (todos em prod contam)
-     return _mant.map(function(x){return String(x).trim();}).indexOf(it)===-1;
-   }).length;
-   var vIRRI=potUnit*qtdIRRI;
-   rowsForPlot=rowsForPlot.filter(function(r){return !(r.chart==='Potencial'&&r.categoria==='F38IRRI'&&r.serie==='Pot');});
-   rowsForPlot.push({tipo:'SERIE',valor:String(vIRRI),cor:'#06b6d4',chart:'Potencial',categoria:'F38IRRI',serie:'Pot',secao:'Operação'});
- })();
-}
+    // F38IRRI
+    (function(){
+      var _cfg={}; try{_cfg=JSON.parse(localStorage.getItem('dashboard_f38irri_v1')||'{}');}catch(e){}
+      var potUnit=parseFloat(String(_cfg.potencial_por_equip||'').replace(',','.'))||0;
+      var _eqGlobal={}; try{_eqGlobal=JSON.parse(localStorage.getItem('dashboard_equip_v1')||'{}');}catch(e){}
+      var _st={};  try{_st=JSON.parse(localStorage.getItem('dashboard_frota_status_v1')||'{}');}catch(e){}
+      var _peIRRI=(_eqGlobal.plantadora&&_eqGlobal.plantadora.F38IRRI)||{};
+      var _prod=Array.isArray(_peIRRI.prod)?_peIRRI.prod:[];
+      var _mant=Array.isArray(_peIRRI.mant)?_peIRRI.mant:[];
+      var _all=[]; _prod.concat(_mant).forEach(function(x){var s=String(x).trim();if(s&&_all.indexOf(s)===-1)_all.push(s);});
+      var _stF38IRRI=(_st.plantadora&&_st.plantadora.F38IRRI)||{};
+      var qtdIRRI=_all.filter(function(it){
+        var norm=String(_stF38IRRI[it]||'').toLowerCase();
+        if(norm==='produtiva'||norm==='prod'||norm==='produtivo'||norm==='operacional'||norm==='op') return true;
+        if(norm==='manutencao'||norm==='manutenção'||norm==='mant') return false;
+        return _mant.map(function(x){return String(x).trim();}).indexOf(it)===-1;
+      }).length;
+      _pushPot('F38IRRI', potUnit*qtdIRRI, '#06b6d4');
+    })();
 
   }
 
@@ -5990,8 +5955,7 @@ if (typeof Chart !== "undefined") {
 <script>(function(){const KEY='dashboard_vel_grunner_v1';const safe=s=>{try{return JSON.parse(s||'{}')}catch(e){return{}}};const merge=(a,b)=>{const o={};Object.keys(a||{}).forEach(k=>o[k]=a[k]);Object.keys(b||{}).forEach(k=>o[k]=b[k]);return o};const getUI=()=>{const map={};try{const tab=document.getElementById('tab-operacao');if(!tab)return map;const cards=[...tab.querySelectorAll('.params-card')];const pick=(card,label)=>{const rows=[...card.querySelectorAll('.param-row')];const row=rows.find(r=>r.firstChild&&r.firstChild.textContent&&r.firstChild.textContent.trim().toLowerCase().startsWith(label));return row?row.querySelector('input')?.value:''};if(cards[0]){const vc=pick(cards[0],'velocidade carregado');const vv=pick(cards[0],'velocidade vazio');if(vc)map.F39C=String(vc).replace(',','.');if(vv)map.F39V=String(vv).replace(',','.')}if(cards[1]){const vc=pick(cards[1],'velocidade carregado');const vv=pick(cards[1],'velocidade vazio');if(vc)map.F41C=String(vc).replace(',','.');if(vv)map.F41V=String(vv).replace(',','.')}}catch(e){}return map};if(typeof window.salvarConfiguracoes==='function'){const old=window.salvarConfiguracoes;window.salvarConfiguracoes=function(data){const before=safe(localStorage.getItem(KEY));const ui=getUI();const ret=old.apply(this,arguments);const after=safe(localStorage.getItem(KEY));const merged=merge(after,merge(before,ui));localStorage.setItem(KEY,JSON.stringify(merged));return ret}}})();</script>
 
 
-<script>(function(){function getQtdProd(front){try{const eq=(typeof loadEquip==='function')?loadEquip(): (function(){try{return JSON.parse(localStorage.getItem('dashboard_equip_v1')||'{}')}catch(e){return{}}})();const arrFront=eq?.grunner_pm?.[front]?.prod; if(Array.isArray(arrFront)) return arrFront.filter(x=>String(x).trim().length>0).length; const arrGlobal=eq?.grunner_pm?.prod; if(Array.isArray(arrGlobal)){const token=String(front); const re=new RegExp('(^|\\W)'+token+'(\\W|$)','i'); const c=arrGlobal.filter(x=>re.test(String(x))).length; return c>0?c:arrGlobal.filter(x=>String(x).trim().length>0).length;} }catch(e){} return 0;} if(typeof window.renderChart==='function'){const old=window.renderChart;window.renderChart=function(chart,rows){if(chart==='Potencial'){const div=old.call(this,chart,rows); try{let rowsForPlot = (typeof getRowsForPlot==='function')? getRowsForPlot() : null; if(!rowsForPlot && Array.isArray(rows)) rowsForPlot=rows; const params=JSON.parse(localStorage.getItem('dashboard_parametros_v1')||'{}'); const caps=JSON.parse(localStorage.getItem('dashboard_cap_equip_v1')||'{}'); const raio=JSON.parse(localStorage.getItem('dashboard_raio_v1')||'{}'); const vel =JSON.parse(localStorage.getItem('dashboard_vel_grunner_v1')||'{}'); const n=v=>{const x=parseFloat(String(v).replace(',','.')); return isFinite(x)?x:0}; const dist39=n(raio.r3439), dist41=n(raio.r3641); const v39C=n(vel.F39C), v39V=n(vel.F39V), v41C=n(vel.F41C), v41V=n(vel.F41V); const tcol39=n(params?.F39?.colhedora?.tempo_colheita_min), tcol41=n(params?.F41?.colhedora?.tempo_colheita_min); const tc39= (dist39>0 && v39C>0)? (dist39/v39C)*60:0, tv39=(dist39>0 && v39V>0)?(dist39/v39V)*60:0; const tc41= (dist41>0 && v41C>0)? (dist41/v41C)*60:0, tv41=(dist41>0 && v41V>0)?(dist41/v41V)*60:0; const ciclo39=(3*2)+tcol39+tc39+tv39; const ciclo41=(3*2)+tcol41+tc41+tv41; const capG39=n(caps?.F39_34?.GRUNNER), capG41=n(caps?.F41_36?.GRUNNER); const tonHa39=n(params?.F39?.colhedora?.toneladas_por_ha), tonHa41=n(params?.F41?.colhedora?.toneladas_por_ha); const pot39=(ciclo39>0&&tonHa39>0&&capG39>0)?(60/ciclo39)*(capG39/tonHa39):0; const pot41=(ciclo41>0&&tonHa41>0&&capG41>0)?(60/ciclo41)*(capG41/tonHa41):0; const qG39=getQtdProd('F39'); const qG41=getQtdProd('F41'); const vGru39=pot39*qG39*0.9; const vGru41=pot41*qG41*0.9; if(Array.isArray(rowsForPlot)){ for(let i=rowsForPlot.length-1;i>=0;i--){const r=rowsForPlot[i]; if(r.chart==='Potencial' && (r.categoria==='GRU_39_34'||r.categoria==='GRU_41_36')) rowsForPlot.splice(i,1);} rowsForPlot.push({tipo:'SERIE',valor:String(vGru39),cor:'#8b5cf6',chart:'Potencial',categoria:'GRU_39_34',serie:'Pot',secao:'Operação'}); rowsForPlot.push({tipo:'SERIE',valor:String(vGru41),cor:'#8b5cf6',chart:'Potencial',categoria:'GRU_41_36',serie:'Pot',secao:'Operação'}); if(typeof redrawChart==='function') try{redrawChart('Potencial',rowsForPlot)}catch(e){} } }catch(e){console.error('Patch Potenciais GRU:',e)} return div;} return old.call(this,chart,rows); } }
-})();</script>
+<!-- GRU patch removed: now handled by getPotencialFrente -->
 
 
 <script>
